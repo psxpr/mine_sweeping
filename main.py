@@ -22,13 +22,29 @@ epoch = 50
 Transition = namedtuple('Transition', ['state', 'ac', 'ac_prob', 'reward', 'done'])
 
 
-def get_action_coords(action_idx, width, height):
-    """将动作索引转换为网格坐标"""
-    # 确保索引在有效范围内
-    action_idx = np.clip(action_idx, 0, width * height - 1)
-    x = action_idx // width
-    y = action_idx % width
-    return x, y
+# def get_action_coords(action_idx, width, height):
+#     """将动作索引转换为网格坐标"""
+#     # 确保索引在有效范围内
+#     action_idx = np.clip(action_idx, 0, width * height - 1)
+#     x = action_idx // width
+#     y = action_idx % width
+#     return x, y
+
+def get_action_from_idx(action_idx, width, height):
+    """将动作索引转换为 (action_type, x, y)"""
+    total_per_type = width * height
+    max_idx = 3 * total_per_type - 1  # 最大有效索引
+    action_idx = np.clip(action_idx, 0, max_idx)  # 限制索引范围
+
+    total_per_type = width * height  # 每种动作类型的索引范围
+    # 解析动作类型（0=翻开，1=标记，2=取消标记）
+    action_type = action_idx // total_per_type
+    # 解析坐标索引（在当前动作类型内的偏移）
+    coord_idx = action_idx % total_per_type
+    # 转换为网格坐标
+    x = coord_idx // width
+    y = coord_idx % width
+    return action_type, x, y
 
 
 def test_get_action(state, net, width, height):
@@ -55,8 +71,8 @@ def test_get_action(state, net, width, height):
     action_idx = top_indices[0, selected_idx].item()
 
     # 转换为坐标并重塑概率分布
-    coords = get_action_coords(action_idx, width, height)
-    prob_dist = action_probs.detach().numpy().reshape([1, height, width])
+    coords = get_action_from_idx(action_idx, width, height)
+    prob_dist = action_probs.detach().numpy().reshape([3, height, width])
 
     return coords, prob_dist
 
@@ -78,7 +94,7 @@ def model_train(times, settings):
                 while env.condition and env.t < 91:
                     # 智能体选择动作
                     a, a_p = net.get_action(s)  # a是动作索引，a_p是动作概率
-                    at = get_action_coords(a[0], settings["width"], settings["height"])  # 将动作索引转换为游戏可理解的格式（如坐标(x,y)）
+                    at = get_action_from_idx(a[0], settings["width"], settings["height"])  # 将动作索引转换为游戏可理解的格式（action_type,x,y）
                     # 与环境交互：执行动作，获取新状态、奖励、是否结束
                     [s_t, r, d] = env.agent_step(at)
                     # 存储经验到PPO的缓冲区
