@@ -65,6 +65,7 @@ class Cell:
 class Minesweeper:
     def __init__(self, difficulty="简单", window=True):
         # 模式控制参数
+        self.mark_accuracy = 0.5
         self.window = window  # True: 玩家模式（带界面），False: 智能体模式（无界面）
 
         # 游戏基础设置
@@ -203,89 +204,179 @@ class Minesweeper:
                     self.cells[x][y].adjacent_mines = count
 
     def calculate_safety_prob(self):
-        """计算每个未翻开格子的安全概率（0~1，1=绝对安全，0=绝对地雷）"""
         width = self.settings["width"]
         height = self.settings["height"]
-        safety_prob = np.ones((width, height))  # 初始值暂时设为1（后续会修正孤立格子）
-        revealed = np.array([[cell.is_revealed for cell in row] for row in self.cells])
-        marked = np.array([[cell.mark_type == 1 for cell in row] for row in self.cells])
+        safety_prob = np.ones((width, height), dtype=np.float64)
+        revealed = np.array([[cell.is_revealed for cell in row] for row in self.cells], dtype=bool)
+        marked = np.array([[cell.mark_type == 1 for cell in row] for row in self.cells], dtype=bool)
 
-        # 第一步：处理与已翻开数字格子相邻的未翻开格子（原有逻辑）
+        if not hasattr(self, 'mark_accuracy'):
+            self.mark_accuracy = 0.5
+        self.mark_accuracy = max(0.05, min(0.95, self.mark_accuracy))
+
+        # 多轮迭代推理
+        for _ in range(5):
+            updated = False
+            for x in range(width):
+                for y in range(height):
+                    cell = self.cells[x][y]
+                    if not cell.is_revealed or cell.adjacent_mines == 0:
+                        continue
+
+                    unknown_count = 0
+                    weighted_marked_count = 0.0
+                    unknown_positions = []
+                    for dx in [-1, 0, 1]:
+                        for dy in [-1, 0, 1]:
+                            nx, ny = x + dx, y + dy
+                            # 1. 严格边界检查：确保nx和ny在有效范围内
+                            if 0 <= nx < width and 0 <= ny < height:
+                                if not revealed[nx, ny]:
+                                    if marked[nx, ny]:
+                                        weighted_marked_count += self.mark_accuracy
+                                    else:
+                                        unknown_count += 1
+                                        unknown_positions.append((nx, ny))
+
+                    remaining_mines = cell.adjacent_mines - weighted_marked_count
+                    remaining_mines = max(0.0, min(unknown_count, remaining_mines))
+
+                    if unknown_count > 0 and remaining_mines <= 1e-6:
+                        for (nx, ny) in unknown_positions:
+                            # 2. 再次检查（双重保险）
+                            if 0 <= nx < width and 0 <= ny < height and safety_prob[nx, ny] != 1.0:
+                                safety_prob[nx, ny] = 1.0
+                                updated = True
+                    elif unknown_count > 0 and remaining_mines >= unknown_count - 1e-6:
+                        for (nx, ny) in unknown_positions:
+                            if 0 <= nx < width and 0 <= ny < height and safety_prob[nx, ny] != 0.0:
+                                safety_prob[nx, ny] = 0.0
+                                updated = True
+            if not updated:
+                break
+
+        # 标记有效性反向验证
+        for x in range(width):
+            for y in range(height):
+                if marked[x, y] and not revealed[x, y]:
+                    invalid = False
+                    for dx in [-1, 0, 1]:
+                        for dy in [-1, 0, 1]:
+                            nx, ny = x + dx, y + dy
+                            # 3. 边界检查
+                            if 0 <= nx < width and 0 <= ny < height and self.cells[nx][ny].is_revealed:
+                                cell = self.cells[nx][ny]
+                                if cell.adjacent_mines == 0:
+                                    continue
+                                mark_count = 0
+                                for ddx in [-1, 0, 1]:
+                                    for ddy in [-1, 0, 1]:
+                                        nnx, nny = nx + ddx, ny + ddy
+                                        # 4. 嵌套循环中的边界检查
+                                        if 0 <= nnx < width and 0 <= nny < height and marked[nnx, nny]:
+                                            mark_count += 1
+                                if mark_count > cell.adjacent_mines:
+                                    invalid = True
+                                    break
+                        if invalid:
+                            break
+                    if invalid:
+                        safety_prob[x, y] = 1.0
+                        self.mark_accuracy = max(0.05, self.mark_accuracy - 0.15)
+
+        # 跨格子关联验证
+        prob_contrib = np.zeros((width, height))
+        contrib_count = np.zeros((width, height), dtype=int)
         for x in range(width):
             for y in range(height):
                 cell = self.cells[x][y]
-                # 只处理已翻开且数字>0的格子（核心逻辑修正：删除cell.is_mine条件）
                 if not cell.is_revealed or cell.adjacent_mines == 0:
                     continue
-
-                # 统计周围未翻开格子和已标记数（原有逻辑）
                 unknown_count = 0
-                marked_count = 0
+                weighted_marked_count = 0.0
                 unknown_positions = []
                 for dx in [-1, 0, 1]:
                     for dy in [-1, 0, 1]:
                         nx, ny = x + dx, y + dy
-                        if 0 <= nx < width and 0 <= ny < height:
-                            if not revealed[nx][ny] and not marked[nx][ny]:
+                        # 5. 边界检查
+                        if 0 <= nx < width and 0 <= ny < height and not revealed[nx, ny]:
+                            if marked[nx, ny]:
+                                weighted_marked_count += self.mark_accuracy
+                            else:
                                 unknown_count += 1
                                 unknown_positions.append((nx, ny))
-                            if marked[nx][ny]:
-                                marked_count += 1
-
-                # 计算剩余地雷数并更新安全概率（原有逻辑）
-                remaining_mines = max(0, cell.adjacent_mines - marked_count)
-                if unknown_count == 0:
+                remaining_mines = max(0.0, cell.adjacent_mines - weighted_marked_count)
+                if unknown_count == 0 or remaining_mines <= 1e-6:
                     continue
-                if remaining_mines == 0:
-                    for (nx, ny) in unknown_positions:
-                        safety_prob[nx][ny] = 1.0
-                elif remaining_mines == unknown_count:
-                    for (nx, ny) in unknown_positions:
-                        safety_prob[nx][ny] = 0.0
-                else:
-                    prob = 1.0 - (remaining_mines / unknown_count)
-                    for (nx, ny) in unknown_positions:
-                        if prob < safety_prob[nx][ny]:
-                            safety_prob[nx][ny] = prob
+                mine_prob = remaining_mines / unknown_count
+                for (nx, ny) in unknown_positions:
+                    # 6. 再次检查
+                    if 0 <= nx < width and 0 <= ny < height:
+                        prob_contrib[nx, ny] += mine_prob
+                        contrib_count[nx, ny] += 1
 
-        # 第二步：处理孤立格子（未被第一步覆盖的未翻开、未标记格子）
-        # 计算剩余安全格子数和剩余未翻开格子数
+        # ---------------------- 孤立格子处理（沿用之前的优化） ----------------------
         total_safe = width * height - self.settings["mines"]
-        revealed_safe = sum(
-            1 for row in self.cells
-            for cell in row
-            if cell.is_revealed and not cell.is_mine
-        )
-        remaining_safe = total_safe - revealed_safe  # 剩余安全格子数
-
-        # 剩余未翻开且未标记的格子数
+        revealed_safe = sum(1 for row in self.cells for cell in row if cell.is_revealed and not cell.is_mine)
+        remaining_safe = total_safe - revealed_safe
         remaining_unknown = sum(
-            1 for x in range(width)
-            for y in range(height)
-            if not revealed[x][y] and not marked[x][y]
-        )
+            1 for x in range(width) for y in range(height) if not revealed[x, y] and not marked[x, y])
+        total_marked = np.sum(marked)
+        estimated_valid_marks = total_marked * self.mark_accuracy
+        remaining_mines_estimated = max(0.0, self.settings["mines"] - estimated_valid_marks)
 
-        # 计算孤立格子的安全概率（如果还有剩余未知格子）
         if remaining_unknown > 0:
-            # 孤立格子安全概率 = 剩余安全格子数 / 剩余未知格子数
-            isolated_prob = remaining_safe / remaining_unknown
-            # 遍历所有格子，对未被第一步处理的孤立格子赋值
+            isolated_safe = remaining_unknown - remaining_mines_estimated
+            isolated_prob = max(0.0, min(1.0, isolated_safe / remaining_unknown))
             for x in range(width):
                 for y in range(height):
-                    if not revealed[x][y] and not marked[x][y]:
-                        # 检查是否是孤立格子（第一步未更新过安全概率，仍为初始值1.0）
-                        if safety_prob[x][y] == 1.0:
-                            safety_prob[x][y] = isolated_prob
+                    if not revealed[x, y] and not marked[x, y] and safety_prob[x, y] == 1.0:
+                        safety_prob[x, y] = isolated_prob
 
-        # 已翻开/已标记的格子安全概率设为-1（无效区域）
+        # 无效区域标记
         for x in range(width):
             for y in range(height):
-                if revealed[x][y] or marked[x][y]:
-                    safety_prob[x][y] = -1.0
+                if revealed[x, y] or marked[x, y]:
+                    safety_prob[x, y] = -1.0
 
-        self.safety_prob_cache = safety_prob  # 缓存结果
-
+        self.safety_prob_cache = safety_prob
         return safety_prob
+
+    def check_unlock_safe_cells(self, x, y):
+        """检查标记后是否解锁绝对安全格子，用于奖励计算"""
+
+        # 辅助函数：检查坐标是否在有效范围内
+        def is_valid(nx, ny):
+            return 0 <= nx < self.settings["width"] and 0 <= ny < self.settings["height"]
+
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                nx, ny = x + dx, y + dy
+                if not is_valid(nx, ny):
+                    continue  # 直接跳过无效坐标，减少嵌套
+
+                cell = self.cells[nx][ny]
+                if not (cell.is_revealed and cell.adjacent_mines > 0):
+                    continue  # 跳过不满足条件的单元格，减少嵌套
+
+                # 计算周围标记数和未知格子数（拆分多行提高可读性）
+                marked_count = sum(
+                    1 for ddx in [-1, 0, 1]
+                    for ddy in [-1, 0, 1]
+                    if is_valid(nx + ddx, ny + ddy)
+                    and self.cells[nx + ddx][ny + ddy].mark_type == 1
+                )
+
+                unknown_count = sum(
+                    1 for ddx in [-1, 0, 1]
+                    for ddy in [-1, 0, 1]
+                    if is_valid(nx + ddx, ny + ddy)
+                    and not self.cells[nx + ddx][ny + ddy].is_revealed
+                    and self.cells[nx + ddx][ny + ddy].mark_type == 0
+                )
+
+                if cell.adjacent_mines - marked_count == 0 and unknown_count > 0:
+                    self.r += 0.3  # 解锁安全格子的额外奖励
 
     def reveal_cell(self, x, y, is_agent=False):
         """翻开格子（兼容智能体模式，不绘制界面）"""
@@ -327,6 +418,34 @@ class Minesweeper:
                         continue
                     self.reveal_cell(x + dx, y + dy, is_agent)
 
+            # 新增：验证周围标记的正确性，更新标记置信度
+            if not cell.is_mine and cell.adjacent_mines > 0 and self.mines_placed:
+                # 统计周围实际地雷数
+                actual_mines = sum(
+                    1 for dx in [-1, 0, 1]
+                    for dy in [-1, 0, 1]
+                    if 0 <= x + dx < self.settings["width"]
+                    and 0 <= y + dy < self.settings["height"]
+                    and self.cells[x + dx][y + dy].is_mine
+                )
+                # 统计周围标记数
+                marked_count = sum(
+                    1 for dx in [-1, 0, 1]
+                    for dy in [-1, 0, 1]
+                    if 0 <= x + dx < self.settings["width"]
+                    and 0 <= y + dy < self.settings["height"]
+                    and self.cells[x + dx][y + dy].mark_type == 1
+                )
+
+                # 验证标记是否正确（标记数 == 实际地雷数）
+                if marked_count == actual_mines:
+                    # 标记正确：提升置信度
+                    self.mark_accuracy = min(0.95, self.mark_accuracy + 0.05)
+                else:
+                    # 标记错误：降低置信度
+                    self.mark_accuracy = max(0.05, self.mark_accuracy - 0.05)
+
+
     def toggle_mark(self, x, y):
         """切换格子标记（仅玩家模式使用）"""
         if not self.window or self.game_over or self.victory:
@@ -337,6 +456,14 @@ class Minesweeper:
         if cell.is_revealed:
             return
         cell.mark_type = (cell.mark_type + 1) % 3
+
+        # 同步更新self.map
+        if cell.mark_type == 1:  # 标记为地雷，对应self.map=-1
+            self.map[x, y] = -1
+        elif cell.mark_type == 2:  # 标记为问号，可设为一个不冲突值，如10
+            self.map[x, y] = 10
+        else:  # 取消标记，恢复为0
+            self.map[x, y] = 0
 
     def check_victory(self):
         """检查胜利（同步更新condition）"""
@@ -577,7 +704,7 @@ class Minesweeper:
     # ---------------------- 智能体交互核心方法 ----------------------
     def get_status(self):
         """获取智能体观察的环境状态（三维数组：[3, H, W], 对应着3层：[状态层, 点击计数层, 安全概率层]）"""
-        # 状态层：未翻开=-1，已翻开地雷=-10，已翻开安全区=周围地雷数
+        # 状态层：地雷标记=-2，未翻开=-1，已翻开地雷=-10，已翻开安全区=周围地雷数
         status_layer = (np.array([[cell.is_revealed for cell in row]
                                   for row in self.cells], dtype=np.float64) - 1) + self.map
         # 计算安全概率层
@@ -588,7 +715,7 @@ class Minesweeper:
 
     def agent_step(self, action):
         """智能体执行一步动作（点击坐标(x,y)），优化奖励机制：鼓励接近胜利的阶段性成果"""
-        x, y = action
+        action_type, x, y = action
         self.r = 0.0  # 重置单步奖励
         total_safe = self.settings["width"] * self.settings["height"] - self.settings["mines"]  # 总安全格子数
 
@@ -619,6 +746,7 @@ class Minesweeper:
             return self._agent_return()
 
         cell = self.cells[x][y]
+
         # 2. 已翻开/已标记格子点击惩罚（避免无效探索）
         if cell.is_revealed or cell.mark_type != 0:
             self.r = -1.0
@@ -631,95 +759,123 @@ class Minesweeper:
 
         # 3. 首次点击生成地雷（保证首步安全）
         if not self.mines_placed:
+            action_type = 0  # 首次点击的动作一定是揭开格子
             self.place_mines(x, y)
             safety_prob = 1.0  # 首步点击的格子绝对安全
 
-        # 4. 执行翻开操作（智能体模式）
-        self.reveal_cell(x, y, is_agent=True)
-
-        # 5. 计算当前已翻开的安全格子数（排除地雷）
-        revealed_safe = sum(
-            1 for row in self.cells
-            for c in row
-            if not c.is_mine and c.is_revealed  # 只统计安全且已翻开的格子
-        )
-
-        if total_safe == 0:  # 避免除以0（极端情况处理）
-            progress = 0.0
-        else:
-            progress = revealed_safe / total_safe  # 计算当前进度比例
-
-        # 6. 核心奖励逻辑：分阶段奖励（完全胜利 > 接近胜利 > 安全探索）
-        if not self.game_over:  # 未踩雷时才给正向奖励
-            # 6.1 安全翻开新格子的基础奖励
-            self.r = 0.8  # 基础探索奖励
-
-            # 6.2 信息价值奖励（高数字格子提供更多线索）
-            self.r += cell.adjacent_mines * 0.3
-
-            # 6.3 安全概率奖励（核心新增：鼓励选择高安全概率格子）
-            if safety_prob >= 1.0:  # 绝对安全格子（优先选择）
-                self.r += 1.5  # 额外高额奖励
-            elif safety_prob >= 0.8:  # 高安全概率
-                self.r += 0.8
-            elif safety_prob >= 0.5:  # 中等安全概率
-                self.r += 0.3
-            else:  # 低安全概率（冒险行为）
-                self.r -= 2.0  # 惩罚冒险
-
-            # 6.4 低安全概率选择追加惩罚（若存在安全概率≥0.8的格子却选<0.5的）
-            safe_cells = sum(
-                1 for x in range(self.settings["width"]) for y in range(self.settings["height"]) if
-                self.calculate_safety_prob()[x][y] >= 0.8)
-            if safe_cells > 0 and safety_prob < 0.5:
-                self.r -= 5.0  # 有高安全格子却冒险，追加惩罚
-
-            # 阶段性奖励动态阈值（按难度调整）
-            if self.difficulty == "简单":
-                threshold = max(1, int(total_safe * 0.2))  # 简单难度阈值20%，更容易触发
-            elif self.difficulty == "中等":
-                threshold = max(1, int(total_safe * 0.15))
+        if action_type == 1:
+            if cell.mark_type == 1:
+                self.r = -0.8  # 重复标记：中等惩罚
             else:
-                threshold = max(1, int(total_safe * 0.1))
+                cell.mark_type = 1  # 执行标记
+                self.map[x, y] = -1
+                self.r = 0.5  # 基础标记奖励
+                # 额外奖励：若标记后解锁安全格子（如周围数字剩余地雷=0）
+                if self.mines_placed:
+                    self.check_unlock_safe_cells(x, y)  # 新增辅助函数
+        elif action_type == 2:
+            if cell.mark_type != 1:
+                self.r = -1.0  # 取消非标记格子：重惩罚
+            else:
+                cell.mark_type = 0  # 取消标记
+                self.map[x, y] = 0
+                self.r = 0.2  # 合理取消：轻微奖励
+        elif action_type == 0:
+            if cell.mark_type == 1:
+                self.r = -2.0  # 翻开已标记格子：重惩罚
 
-            # 一次性阶段性奖励
-            if not self.stage_reward and (total_safe - threshold) <= revealed_safe < total_safe:
-                self.r += 20.0  # 接近胜利的额外奖励（比完全胜利低，留提升空间）
-                self.stage_reward = True
+        if action_type == 0 and cell.mark_type == 0:
+            # 4. 执行翻开操作（智能体模式）
+            self.reveal_cell(x, y, is_agent=True)
 
-            # 进度奖励：每达到20%进度且未奖励过，则追加奖励
-            if progress >= 0.2 and not self.stage_reward["20%"]:
-                self.r += 5.0  # 20%进度奖励
-                self.stage_reward["20%"] = True  # 标记为已奖励
-            if progress >= 0.4 and not self.stage_reward["40%"]:
-                self.r += 5.0  # 40%进度奖励
-                self.stage_reward["40%"] = True
-            if progress >= 0.6 and not self.stage_reward["60%"]:
-                self.r += 5.0  # 60%进度奖励
-                self.stage_reward["60%"] = True
-            if progress >= 0.8 and not self.stage_reward["80%"]:
-                self.r += 5.0  # 80%进度奖励
-                self.stage_reward["80%"] = True
+            # 5. 计算当前已翻开的安全格子数（排除地雷）
+            revealed_safe = sum(
+                1 for row in self.cells
+                for c in row
+                if not c.is_mine and c.is_revealed  # 只统计安全且已翻开的格子
+            )
 
-        # 7. 终局状态处理（完全胜利/踩雷失败）
-        if self.game_over:  # 踩雷失败：重惩罚
-            print("踩雷了，游戏失败！")
-            self.r = -50.0
-            self.condition = False
-            # 智能体窗口模式下，延时1秒重启
-            if self.window:
-                self.draw_grid()
-                pygame.display.flip()  # 刷新界面显示所有地雷
-                self.agent_current_click = None  # 重置高亮标记
-                time.sleep(1.)
-        elif revealed_safe == total_safe:  # 完全胜利：最高奖励
-            print("扫雷完成，游戏胜利！")
-            self.r = 100.0 + (self.settings["width"] * self.settings["height"] - self.t) * 0.05  # 快速胜利加成
-            self.condition = False
+            if total_safe == 0:  # 避免除以0（极端情况处理）
+                progress = 0.0
+            else:
+                progress = revealed_safe / total_safe  # 计算当前进度比例
 
-        # 8. 重复点击惩罚（累积惩罚）
-        if self.count[x][y] > 0:
-            self.r -= 0.3 * self.count[x][y]  # 重复次数越多，惩罚越重（如第2次-0.6，第3次-0.9）
+            # 6. 核心奖励逻辑：分阶段奖励（完全胜利 > 接近胜利 > 安全探索）
+            if not self.game_over:  # 未踩雷时才给正向奖励
+                # 6.1 安全翻开新格子的基础奖励
+                self.r = 0.8  # 基础探索奖励
+
+                # 6.2 信息价值奖励（高数字格子提供更多线索）
+                self.r += cell.adjacent_mines * 0.3
+
+                # 6.3 安全概率奖励（核心新增：鼓励选择高安全概率格子）
+                if safety_prob >= 1.0:  # 绝对安全格子（优先选择）
+                    self.r += 1.5  # 额外高额奖励
+                elif safety_prob >= 0.8:  # 高安全概率
+                    self.r += 0.8
+                elif safety_prob >= 0.5:  # 中等安全概率
+                    self.r += 0.3
+                else:  # 低安全概率（冒险行为）
+                    self.r -= 2.0  # 惩罚冒险
+
+                # 6.4 低安全概率选择追加惩罚（若存在安全概率≥0.8的格子却选<0.5的）
+                safe_cells = sum(
+                    1 for x in range(self.settings["width"]) for y in range(self.settings["height"]) if
+                    self.calculate_safety_prob()[x][y] >= 0.8)
+                if safe_cells > 0 and safety_prob < 0.5:
+                    self.r -= 5.0  # 有高安全格子却冒险，追加惩罚
+
+                # 阶段性奖励动态阈值（按难度调整）
+                if self.difficulty == "简单":
+                    threshold = max(1, int(total_safe * 0.2))  # 简单难度阈值20%，更容易触发
+                elif self.difficulty == "中等":
+                    threshold = max(1, int(total_safe * 0.15))
+                else:
+                    threshold = max(1, int(total_safe * 0.1))
+
+                # 一次性阶段性奖励
+                if not self.stage_reward and (total_safe - threshold) <= revealed_safe < total_safe:
+                    self.r += 20.0  # 接近胜利的额外奖励（比完全胜利低，留提升空间）
+                    self.stage_reward = True
+
+                # 进度奖励：每达到20%进度且未奖励过，则追加奖励
+                if progress >= 0.2 and not self.stage_reward["20%"]:
+                    self.r += 5.0  # 20%进度奖励
+                    self.stage_reward["20%"] = True  # 标记为已奖励
+                if progress >= 0.4 and not self.stage_reward["40%"]:
+                    self.r += 5.0  # 40%进度奖励
+                    self.stage_reward["40%"] = True
+                if progress >= 0.6 and not self.stage_reward["60%"]:
+                    self.r += 5.0  # 60%进度奖励
+                    self.stage_reward["60%"] = True
+                if progress >= 0.8 and not self.stage_reward["80%"]:
+                    self.r += 5.0  # 80%进度奖励
+                    self.stage_reward["80%"] = True
+
+            # 7. 终局状态处理（完全胜利/踩雷失败）
+            if self.game_over:  # 踩雷失败：重惩罚
+                print("踩雷了，游戏失败！")
+                self.r = -50.0
+                self.condition = False
+                # 智能体窗口模式下，延时1秒重启
+                if self.window:
+                    self.draw_grid()
+                    pygame.display.flip()  # 刷新界面显示所有地雷
+                    self.agent_current_click = None  # 重置高亮标记
+                    time.sleep(1.)
+            elif revealed_safe == total_safe:  # 完全胜利：最高奖励
+                print("扫雷完成，游戏胜利！")
+                self.r = 100.0 + (self.settings["width"] * self.settings["height"] - self.t) * 0.05  # 快速胜利加成
+                correct_marks = sum(1 for row in self.cells for c in row if c.mark_type == 1 and c.is_mine)
+                wrong_marks = sum(1 for row in self.cells for c in row if c.mark_type == 1 and not c.is_mine)
+                self.r = 100.0 + (self.settings["width"] * self.settings["height"] - self.t) * 0.1
+                self.r += correct_marks * 6.0  # 正确标记奖励
+                self.r -= wrong_marks * 4.0  # 错误标记惩罚
+                self.condition = False
+
+            # 8. 重复点击惩罚（累积惩罚）
+            if self.count[x][y] > 0:
+                self.r -= 0.3 * self.count[x][y]  # 重复次数越多，惩罚越重（如第2次-0.6，第3次-0.9）
 
         # 9. 步数限制（防止无限循环，适配难度）
         self.t += 1

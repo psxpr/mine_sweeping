@@ -29,13 +29,7 @@ class PolicyNet(nn.Module):
         # 卷积特征提取 + 展平层（一体化设计）
         self.features = nn.Sequential(
             # 第一层卷积：提取基础空间特征
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=32,
-                kernel_size=3,
-                stride=1,
-                padding=1  # 保持特征图尺寸与输入一致
-            ),
+            nn.Conv2d(in_channels=in_channels, out_channels=32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),  # inplace=True 节省内存
 
             # 第二层卷积：加深特征提取
@@ -46,8 +40,8 @@ class PolicyNet(nn.Module):
             nn.Conv2d(128, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
 
-            # 输出层卷积：将通道数压缩至1（对应动作概率的空间分布）
-            nn.Conv2d(32, 1, kernel_size=3, stride=1, padding=1),
+            # 输出3通道：分别对应 action_type=0（翻开）、1（标记）、2（取消标记）
+            nn.Conv2d(32, 3, kernel_size=3, stride=1, padding=1),
 
             # 展平层：将 (batch, 1, H, W) 展平为 (batch, 1*H*W)
             nn.Flatten(start_dim=1)
@@ -61,8 +55,12 @@ class PolicyNet(nn.Module):
         # 特征提取 + 展平
         x = self.features(x)  # 输出形状：(batch_size, H*W)
 
-        # 概率归一化
-        action_probs = self.softmax(x)
+        # 重塑为 (batch_size, 3*height*width)，便于计算总概率分布
+        batch_size = x.shape[0]
+        action_logits = x.view(batch_size, 3 * self.input_shape[0] * self.input_shape[1])
+
+        # 归一化得到动作概率（所有动作类型+坐标的总概率和为1）
+        action_probs = torch.softmax(action_logits, dim=1)
 
         return action_probs
 
@@ -119,11 +117,11 @@ class PPO():
         self.action = torch.load(path)  # 从路径加载动作网络参数
 
     def get_action(self, x):
-        x = x.unsqueeze(dim=0).to(device)  # 扩展为batch维度 [1, 2, H, W]
-        ac_prob = self.action(x)  # 得到动作概率分布 [1, N]（N为动作数）
-        a = Categorical(ac_prob).sample()[0]  # 按概率分布采样动作
-        ac_pro = ac_prob[0][a]  # 记录该动作的概率
-        return [a.item()], [ac_pro.item()]  # 返回动作和对应的概率
+        x = x.unsqueeze(dim=0).to(device)
+        ac_prob = self.action(x)  # 输出形状：(1, 3*H*W)
+        a = Categorical(ac_prob).sample()[0]  # 采样动作索引（0~3*H*W-1）
+        ac_pro = ac_prob[0][a]
+        return [a.item()], [ac_pro.item()]  # 返回动作索引和对应概率
 
     def update(self):
         if not self.suffer:
@@ -222,6 +220,9 @@ class PPO():
 
     def plot_training_curves(self, smooth_window=10):
         """绘制训练曲线"""
+        # 设置中文字体
+        plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei", "Heiti TC", "WenQuanYi Micro Hei", "SimSun"]
+
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
         fig.suptitle('PPO扫雷训练监控', fontsize=16)
 
@@ -260,9 +261,6 @@ class PPO():
         axes[1, 1].set_ylabel('新旧策略比例')
         axes[1, 1].legend()
         axes[1, 1].grid(True)
-
-        # 设置中文字体
-        plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei", "Heiti TC", "WenQuanYi Micro Hei", "SimSun"]
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.show()
