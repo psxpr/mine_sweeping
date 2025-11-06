@@ -101,7 +101,12 @@ class Minesweeper:
         self.hovered_button = None
         self.hovered_restart_btn = False
         self.safety_prob_cache = None
-        self.stage_reward = False
+        self.stage_reward = {  # 初始化进度奖励记录字典
+            "20%": False,
+            "40%": False,
+            "60%": False,
+            "80%": False
+        }
 
         # 初始化游戏
         self.reset()
@@ -121,7 +126,12 @@ class Minesweeper:
         self.start_time = None
         self.elapsed_time = 0
         self.safety_prob_cache = None
-        self.stage_reward = False
+        self.stage_reward = {  # 重置进度奖励记录
+            "20%": False,
+            "40%": False,
+            "60%": False,
+            "80%": False
+        }
 
         # 重置智能体相关变量
         self.r = 0.0
@@ -585,6 +595,15 @@ class Minesweeper:
         # 获取当前格子的安全概率（用于奖励计算）
         safety_prob = self.calculate_safety_prob()[x][y] if self.mines_placed else 1.0  # 未放地雷时默认安全
 
+        # 过滤绝对雷区动作（安全概率≤0.0）
+        if self.mines_placed:
+            if safety_prob <= 0.0:
+                self.r = -1.0
+                self.t += 1
+                self.R.append(self.r)
+                self.actions.append((x, y))
+                return self._agent_return()
+
         if self.window:
             # 记录当前点击位置（用于高亮）
             self.agent_current_click = (x, y)
@@ -607,12 +626,7 @@ class Minesweeper:
             self.count[x][y] += 1
             self.R.append(self.r)
             self.actions.append((x, y))
-            # 无效点击也显示1秒高亮
-            if self.window:
-                self.draw()
-                pygame.display.flip()
-                time.sleep(1)
-                self.agent_current_click = None
+
             return self._agent_return()
 
         # 3. 首次点击生成地雷（保证首步安全）
@@ -630,13 +644,18 @@ class Minesweeper:
             if not c.is_mine and c.is_revealed  # 只统计安全且已翻开的格子
         )
 
+        if total_safe == 0:  # 避免除以0（极端情况处理）
+            progress = 0.0
+        else:
+            progress = revealed_safe / total_safe  # 计算当前进度比例
+
         # 6. 核心奖励逻辑：分阶段奖励（完全胜利 > 接近胜利 > 安全探索）
         if not self.game_over:  # 未踩雷时才给正向奖励
             # 6.1 安全翻开新格子的基础奖励
             self.r = 0.8  # 基础探索奖励
 
-            # 6.2 信息价值奖励（高数字格子提供更多地雷线索）
-            self.r += cell.adjacent_mines * 0.3  # 降低权重，避免冒险
+            # 6.2 信息价值奖励（高数字格子提供更多线索）
+            self.r += cell.adjacent_mines * 0.3
 
             # 6.3 安全概率奖励（核心新增：鼓励选择高安全概率格子）
             if safety_prob >= 1.0:  # 绝对安全格子（优先选择）
@@ -668,6 +687,20 @@ class Minesweeper:
                 self.r += 20.0  # 接近胜利的额外奖励（比完全胜利低，留提升空间）
                 self.stage_reward = True
 
+            # 进度奖励：每达到20%进度且未奖励过，则追加奖励
+            if progress >= 0.2 and not self.stage_reward["20%"]:
+                self.r += 5.0  # 20%进度奖励
+                self.stage_reward["20%"] = True  # 标记为已奖励
+            if progress >= 0.4 and not self.stage_reward["40%"]:
+                self.r += 5.0  # 40%进度奖励
+                self.stage_reward["40%"] = True
+            if progress >= 0.6 and not self.stage_reward["60%"]:
+                self.r += 5.0  # 60%进度奖励
+                self.stage_reward["60%"] = True
+            if progress >= 0.8 and not self.stage_reward["80%"]:
+                self.r += 5.0  # 80%进度奖励
+                self.stage_reward["80%"] = True
+
         # 7. 终局状态处理（完全胜利/踩雷失败）
         if self.game_over:  # 踩雷失败：重惩罚
             print("踩雷了，游戏失败！")
@@ -681,7 +714,7 @@ class Minesweeper:
                 time.sleep(1.)
         elif revealed_safe == total_safe:  # 完全胜利：最高奖励
             print("扫雷完成，游戏胜利！")
-            self.r = 200.0 + (self.settings["width"] * self.settings["height"] - self.t) * 0.05  # 快速胜利加成
+            self.r = 100.0 + (self.settings["width"] * self.settings["height"] - self.t) * 0.05  # 快速胜利加成
             self.condition = False
 
         # 8. 重复点击惩罚（累积惩罚）
@@ -691,7 +724,7 @@ class Minesweeper:
         # 9. 步数限制（防止无限循环，适配难度）
         self.t += 1
         self.count[x][y] += 1  # 记录点击次数
-        max_steps = max(100, total_safe * 2)  # 最大步数=安全格子数×2（保证足够探索时间）
+        max_steps = max(100, total_safe * 1)  # 最大步数=安全格子数×2（保证足够探索时间）
         if self.t >= max_steps:
             self.r = -5.0
             self.condition = False

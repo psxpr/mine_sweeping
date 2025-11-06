@@ -2,6 +2,11 @@ import random
 import torch
 import torch.nn as nn
 from torch.distributions.categorical import Categorical
+from collections import defaultdict
+import matplotlib.pyplot as plt
+import matplotlib
+import numpy as np
+matplotlib.use('TkAgg')
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -64,25 +69,25 @@ class PolicyNet(nn.Module):
 
 # 价值网络
 class ValueNet(nn.Module):
-    def __init__(self):
+    def __init__(self, input_shape=(10, 10), in_channels=3):
         super(ValueNet, self).__init__()
-
-        self.flatten = nn.Flatten(start_dim=1)
-        self.fc1 = nn.Linear(300, 512)
-        self.fc2 = nn.Linear(512, 512)
-        self.fc3 = nn.Linear(512, 1)
-        self.relu = nn.ReLU()
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64 * input_shape[0] * input_shape[1], 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
 
     def forward(self, x):
-        x = self.flatten(x)
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        out = self.fc3(x)
-        return out
+        return self.features(x)
 
 
 class PPO():
-    def __init__(self, input_shape=[10, 10], up_time=10, batch_size=32, a_lr=1e-5, b_lr=1e-5, gama=0.9, epsilon=0.1):
+    def __init__(self, input_shape=(10, 10), up_time=10, batch_size=32, a_lr=1e-5, b_lr=1e-5, gama=0.9, epsilon=0.1):
         self.up_time = up_time  # 每次更新的迭代次数
         self.batch_size = batch_size  # 批量大小
         self.gama = gama  # 折扣因子（未来奖励的衰减系数）
@@ -90,14 +95,25 @@ class PPO():
         self.suffer = []  # 经验回放缓冲区（存储状态、动作、奖励等）
         self.action = PolicyNet(input_shape)  # 动作网络
         self.action.to(device)
-        self.value = ValueNet()  # 价值网络
+        self.value = ValueNet(input_shape)  # 价值网络
         self.value.to(device)
         self.action_optim = torch.optim.Adam(self.action.parameters(), lr=a_lr)  # 动作网络优化器
         self.value_optim = torch.optim.Adam(self.value.parameters(), lr=b_lr)  # 价值网络优化器
         self.loss = nn.MSELoss().to(device)  # 价值网络的损失函数（均方误差）
 
+        # 训练日志记录
+        self.logs = defaultdict(list)
+        self.episode_rewards = []  # 记录每个episode的总奖励
+        self.current_episode_reward = 0  # 当前episode的累计奖励
+        self.update_count = 0  # 更新次数计数器
+
     def append(self, buffer):
         self.suffer.append(buffer)  # 将单条经验（状态、动作、奖励等）加入缓冲区
+
+        self.current_episode_reward += buffer.reward
+        if buffer.done:
+            self.episode_rewards.append(self.current_episode_reward)
+            self.current_episode_reward = 0  # 重置当前episode奖励
 
     def load_net(self, path):
         self.action = torch.load(path)  # 从路径加载动作网络参数
@@ -110,79 +126,164 @@ class PPO():
         return [a.item()], [ac_pro.item()]  # 返回动作和对应的概率
 
     def update(self):
+        if not self.suffer:
+            return
+
         states = torch.stack([t.state for t in self.suffer], dim=0).to(device)
         actions = torch.tensor([t.ac for t in self.suffer], dtype=torch.int).to(device)
         rewards = [t.reward for t in self.suffer]
         done = [t.done for t in self.suffer]
         old_probs = torch.tensor([t.ac_prob for t in self.suffer], dtype=torch.float32).to(device)  # .detach()
 
-        false_indexes = [i + 1 for i, val in enumerate(done) if not val]
-        if len(false_indexes) >= 0:
-            idx, reward_all = 0, []
-            for i in false_indexes:
-                reward = rewards[idx:i]
+        reward_all = []
+        start_idx = 0  # 记录当前episode的起始索引
+        for i in range(len(done)):
+            if i == len(done) - 1 or done[i]:  # 到达末尾或episode结束
+                episode_rewards = rewards[start_idx:i + 1]  # 提取当前episode的所有奖励
                 R = 0
-                Rs = []
-                reward.reverse()
-                for r in reward:
-                    R = r + R * self.gama
-                    Rs.append(R)
-                Rs.reverse()
-                reward_all.extend(Rs)
-                idx = i
-        else:
+                episode_returns = []
+                for r in reversed(episode_rewards):  # 从后向前计算折扣回报
+                    R = r + self.gama * R
+                    episode_returns.append(R)
+                reward_all.extend(reversed(episode_returns))  # 保持时间顺序
+                start_idx = i + 1  # 移动到下一个episode的起始位置
+        # 如果最后一个 episode 未终止，强制截断
+        if start_idx < len(rewards):
+            episode_rewards = rewards[start_idx:]
             R = 0
-            reward_all = []
-            rewards.reverse()
-            for r in rewards:
-                R = r + R * self.gama
-                reward_all.append(R)
-            reward_all.reverse()
+            episode_returns = []
+            for r in reversed(episode_rewards):
+                R = r + self.gama * R
+                episode_returns.append(R)
+            reward_all.extend(reversed(episode_returns))
+
+        # 更新网络
+        self.action.train()
+        self.value.train()
         Rs = torch.tensor(reward_all, dtype=torch.float32).to(device)
+
+        total_action_loss = 0
+        total_value_loss = 0
+        total_advantage = 0
+        total_ratio = 0
+
         for _ in range(self.up_time):
-            self.action.train()
-            self.value.train()
             for n in range(max(10, int(10 * len(self.suffer) / self.batch_size))):
-                # 生成 reward_all 后转换为 Rs 张量
-                Rs = torch.tensor(reward_all, dtype=torch.float32).to(device)
-                rs_length = Rs.size(0)
-
-                # 1. 核心校验：确保 rs_length > 0，否则直接返回不更新
-                if rs_length == 0:
-                    print("警告：奖励序列为空，跳过本次更新（可能是游戏未产生有效奖励）")
-                    return
-
-                # 2. 确保 sample_size 有效（至少为1，且不超过 rs_length）
-                sample_size = min(self.batch_size, rs_length)
-                sample_size = max(1, sample_size)  # 防止 sample_size 为0
-
-                # 3. 生成索引（此时 rs_length 必然 > 0，且 sample_size 有效）
-                index = torch.randint(0, rs_length, (sample_size,), dtype=torch.int64, device=device)
-
-                # 4. 索引选择操作（添加额外校验，确保索引有效）
-                try:
-                    v_target = torch.index_select(Rs, dim=0, index=index).unsqueeze(dim=1)
-                except RuntimeError as e:
-                    print(f"索引选择失败：{e}")
-                    print(f"Rs 长度: {rs_length}, 索引范围: [{index.min()}, {index.max()}]")
-                    return  # 出错时跳过本次更新
-
+                index = torch.tensor(random.sample(range(len(self.suffer)), self.batch_size),
+                                     dtype=torch.int64).to(device)
+                v_target = torch.index_select(Rs, dim=0, index=index).unsqueeze(dim=1)
                 v = self.value(torch.index_select(states, 0, index))
+
+                # 计算优势函数
                 adta = v_target - v
-                adta = adta.detach()
+                adta_detach = adta.detach()
+
+                # 计算策略损失
                 probs = self.action(torch.index_select(states, 0, index))
                 pro_index = torch.index_select(actions, 0, index).to(torch.int64)
-
                 probs_a = torch.gather(probs, 1, pro_index)
                 ratio = probs_a / torch.index_select(old_probs, 0, index).to(device)
-                surr1 = ratio * adta
-                surr2 = torch.clip(ratio, 1 - self.epsilon, 1 + self.epsilon) * adta.to(device)
+
+                surr1 = ratio * adta_detach
+                surr2 = torch.clip(ratio, 1 - self.epsilon, 1 + self.epsilon) * adta_detach
                 action_loss = -torch.mean(torch.minimum(surr1, surr2))
+
+                # 更新策略网络
                 self.action_optim.zero_grad()
                 action_loss.backward(retain_graph=True)
                 self.action_optim.step()
+
+                # 计算并更新价值网络
                 value_loss = self.loss(v_target, v)
                 self.value_optim.zero_grad()
                 value_loss.backward()
                 self.value_optim.step()
+
+                # 累计统计信息
+                total_action_loss += action_loss.item()
+                total_value_loss += value_loss.item()
+                total_advantage += torch.mean(torch.abs(adta)).item()
+                total_ratio += torch.mean(ratio).item()
+
+                # 记录每步更新的损失
+                self.logs['step_action_loss'].append(action_loss.item())
+                self.logs['step_value_loss'].append(value_loss.item())
+
+        # 计算平均统计信息并记录
+        num_steps = self.up_time * max(10, int(10 * len(self.suffer) / self.batch_size))
+        self.update_count += 1
+        self.logs['update_action_loss'].append(total_action_loss / num_steps)
+        self.logs['update_value_loss'].append(total_value_loss / num_steps)
+        self.logs['update_advantage'].append(total_advantage / num_steps)
+        self.logs['update_ratio'].append(total_ratio / num_steps)
+
+        # 清空经验池
         self.suffer = []
+
+    def plot_training_curves(self, smooth_window=10):
+        """绘制训练曲线"""
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('PPO扫雷训练监控', fontsize=16)
+
+        # 1. 每步损失曲线
+        axes[0, 0].plot(self.logs['step_action_loss'], label='策略损失', alpha=0.3)
+        axes[0, 0].plot(self.logs['step_value_loss'], label='价值损失', alpha=0.3)
+        axes[0, 0].set_title('每步损失变化')
+        axes[0, 0].set_xlabel('更新步骤')
+        axes[0, 0].set_ylabel('损失值')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True)
+
+        # 2. 每轮更新的平均损失
+        axes[0, 1].plot(self.logs['update_action_loss'], label='平均策略损失')
+        axes[0, 1].plot(self.logs['update_value_loss'], label='平均价值损失')
+        axes[0, 1].set_title('每轮更新平均损失')
+        axes[0, 1].set_xlabel('更新轮次')
+        axes[0, 1].set_ylabel('平均损失值')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True)
+
+        # 3. 优势函数和策略更新比例
+        axes[1, 0].plot(self.logs['update_advantage'], label='平均优势函数绝对值')
+        axes[1, 0].set_title('优势函数变化')
+        axes[1, 0].set_xlabel('更新轮次')
+        axes[1, 0].set_ylabel('优势函数值')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True)
+
+        axes[1, 1].plot(self.logs['update_ratio'], label='策略更新比例')
+        axes[1, 1].axhline(y=1.0, color='r', linestyle='--', label='基准值1.0')
+        axes[1, 1].axhline(y=1 + self.epsilon, color='g', linestyle='--', label=f'上限{1 + self.epsilon}')
+        axes[1, 1].axhline(y=1 - self.epsilon, color='g', linestyle='--', label=f'下限{1 - self.epsilon}')
+        axes[1, 1].set_title('策略更新比例')
+        axes[1, 1].set_xlabel('更新轮次')
+        axes[1, 1].set_ylabel('新旧策略比例')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True)
+
+        # 设置中文字体
+        plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei", "Heiti TC", "WenQuanYi Micro Hei", "SimSun"]
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.show()
+
+        # 单独绘制奖励曲线
+        plt.figure(figsize=(12, 6))
+        plt.plot(self.episode_rewards, label='每局奖励', alpha=0.5)
+
+        # 平滑奖励曲线
+        if len(self.episode_rewards) >= smooth_window:
+            smoothed_rewards = np.convolve(
+                self.episode_rewards,
+                np.ones(smooth_window) / smooth_window,
+                mode='valid'
+            )
+            plt.plot(range(smooth_window - 1, len(self.episode_rewards)),
+                     smoothed_rewards, label=f'{smooth_window}局平均奖励', color='red')
+
+        plt.title('每局奖励变化')
+        plt.xlabel('局数')
+        plt.ylabel('奖励值')
+        plt.legend()
+        plt.grid(True)
+        plt.show()

@@ -75,7 +75,7 @@ def model_train(times, settings):
                 env.reset()  # 重置游戏环境（开始新一局）
                 s = torch.tensor(env.get_status(), dtype=torch.float32)  # 获取初始状态并转为Tensor
                 # 游戏循环：直到游戏结束（踩雷或获胜）或步数超过51（防止无限循环）
-                while env.condition and env.t < 181:
+                while env.condition and env.t < 91:
                     # 智能体选择动作
                     a, a_p = net.get_action(s)  # a是动作索引，a_p是动作概率
                     at = get_action_coords(a[0], settings["width"], settings["height"])  # 将动作索引转换为游戏可理解的格式（如坐标(x,y)）
@@ -106,6 +106,8 @@ def model_train(times, settings):
     line.add_yaxis(y_axis=Re, series_name='Recall')
     line.render('result.html')
 
+    net.plot_training_curves()
+
 
 def test(path, settings):
     env = Minesweeper(difficulty=difficulty, window=True)
@@ -115,9 +117,12 @@ def test(path, settings):
     s = torch.tensor(env.get_status(), dtype=torch.float32)
     a_p = 0
     for i in range(10):
+        k = 0
         while env.condition:
             a, a_p = test_get_action(s, net, width=settings["width"], height=settings["height"])
             [s_t, r, d] = env.agent_step(a)
+            print("第{}步：动作a = {}, 奖励r = {}".format(k, a, r))
+            k = k + 1
             s = s_t
             time.sleep(1.)
         env.reset()
