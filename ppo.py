@@ -6,6 +6,7 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import matplotlib
 import numpy as np
+import os
 matplotlib.use('TkAgg')
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -106,17 +107,72 @@ class PPO():
         self.episode_rewards = []  # 记录每个episode的总奖励
         self.current_episode_reward = 0  # 当前episode的累计奖励
         self.update_count = 0  # 更新次数计数器
+        self.total_episodes = 0  # 总训练回合数
+        self.total_steps = 0  # 总训练步数
 
     def append(self, buffer):
         self.suffer.append(buffer)  # 将单条经验（状态、动作、奖励等）加入缓冲区
 
         self.current_episode_reward += buffer.reward
+        self.total_steps += 1  # 累计总步数
         if buffer.done:
             self.episode_rewards.append(self.current_episode_reward)
             self.current_episode_reward = 0  # 重置当前episode奖励
+            self.total_episodes += 1  # 累计总回合数
 
     def load_net(self, path):
         self.action = torch.load(path)  # 从路径加载动作网络参数
+
+    def save_checkpoint(self, path="checkpoint.pt"):
+        """保存模型 checkpoint（支持续训）"""
+        checkpoint = {
+            # 模型参数
+            "action_state_dict": self.action.state_dict(),
+            "value_state_dict": self.value.state_dict(),
+            # 优化器状态
+            "action_optim_state_dict": self.action_optim.state_dict(),
+            "value_optim_state_dict": self.value_optim.state_dict(),
+            # 训练进度
+            "total_episodes": self.total_episodes,
+            "total_steps": self.total_steps,
+            "episode_rewards": self.episode_rewards,
+            "update_count": self.update_count,
+            "logs": self.logs,
+            # 随机种子状态
+            "rng_state": torch.random.get_rng_state()
+        }
+        # 确保保存目录存在
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        torch.save(checkpoint, path)
+        print(f"已保存 checkpoint 到 {path}，回合数：{self.total_episodes}，总步数：{self.total_steps}")
+
+    def load_checkpoint(self, path="checkpoint.pt"):
+        """加载模型 checkpoint（续训入口）"""
+        if not os.path.exists(path):
+            print(f"未找到 {path}，将从头开始训练")
+            return
+
+        checkpoint = torch.load(path, map_location=device)
+
+        # 恢复模型参数
+        self.action.load_state_dict(checkpoint["action_state_dict"])
+        self.value.load_state_dict(checkpoint["value_state_dict"])
+
+        # 恢复优化器状态（关键：保证续训时优化方向连续）
+        self.action_optim.load_state_dict(checkpoint["action_optim_state_dict"])
+        self.value_optim.load_state_dict(checkpoint["value_optim_state_dict"])
+
+        # 恢复训练进度
+        self.total_episodes = checkpoint["total_episodes"]
+        self.total_steps = checkpoint["total_steps"]
+        self.episode_rewards = checkpoint["episode_rewards"]
+        self.update_count = checkpoint["update_count"]
+        self.logs = checkpoint["logs"]
+
+        # 恢复随机种子状态
+        torch.random.set_rng_state(checkpoint["rng_state"])
+
+        print(f"已加载 checkpoint 从 {path}，继续训练：回合数 {self.total_episodes}，总步数 {self.total_steps}")
 
     def get_action(self, x):
         x = x.unsqueeze(dim=0).to(device)  # 扩展为batch维度 [1, 2, H, W]
@@ -222,6 +278,9 @@ class PPO():
 
     def plot_training_curves(self, smooth_window=10):
         """绘制训练曲线"""
+        # 设置中文字体
+        plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei", "Heiti TC", "WenQuanYi Micro Hei", "SimSun"]
+
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
         fig.suptitle('PPO扫雷训练监控', fontsize=16)
 
@@ -260,9 +319,6 @@ class PPO():
         axes[1, 1].set_ylabel('新旧策略比例')
         axes[1, 1].legend()
         axes[1, 1].grid(True)
-
-        # 设置中文字体
-        plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei", "Heiti TC", "WenQuanYi Micro Hei", "SimSun"]
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.show()

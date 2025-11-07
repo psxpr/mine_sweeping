@@ -64,6 +64,7 @@ def test_get_action(state, net, width, height):
 def model_train(times, settings):
     env = Minesweeper(difficulty=difficulty, window=False)
     net = PPO(input_shape=[mine_settings["width"], mine_settings["height"]], up_time=up_time, batch_size=batch_size, a_lr=a_lr, b_lr=b_lr, gama=gama, epsilon=epsilon)
+    # net.load_checkpoint("net_model.pt")  # 加载上次保存的状态
 
     Rs = []  # 存储每一局游戏结束后的总奖励
 
@@ -94,8 +95,12 @@ def model_train(times, settings):
                 # 更新进度条显示
                 pbar.set_postfix({'return': '%.2f' % R})  # 显示本局的总奖励
                 pbar.update(1)  # 进度条加1
+        if (net.total_episodes + 1) % 100 == 0:
+            net.save_checkpoint("net_model.pt")
+            net.plot_training_curves()
 
     torch.save(net.action,'net_model.pt')
+    net.plot_training_curves()
     Re = []
     for i in range(int(len(Rs)/50)):
         idx = i*50
@@ -105,8 +110,6 @@ def model_train(times, settings):
     line.add_xaxis(xaxis_data=x)
     line.add_yaxis(y_axis=Re, series_name='Recall')
     line.render('result.html')
-
-    net.plot_training_curves()
 
 
 def test(path, settings):

@@ -622,6 +622,9 @@ class Minesweeper:
         # 2. 已翻开/已标记格子点击惩罚（避免无效探索）
         if cell.is_revealed or cell.mark_type != 0:
             self.r = -1.0
+            if self.count[x][y] > 0:
+                self.r -= 0.3 * self.count[x][y]  # 重复次数越多，惩罚越重
+
             self.t += 1
             self.count[x][y] += 1
             self.R.append(self.r)
