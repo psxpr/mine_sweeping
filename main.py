@@ -1,7 +1,5 @@
 from collections import namedtuple
-
 import time
-
 from env import Minesweeper, DIFFICULTIES
 from ppo import PPO
 from tqdm import tqdm
@@ -9,15 +7,17 @@ from torch.distributions.categorical import Categorical
 from pyecharts.charts import Line
 import torch
 import numpy as np
+import collections
+import torch.serialization
 
 
 batch_size = 32
 a_lr = 0.0001
-b_lr = 0.002
-gama = 0.995
-epsilon = 0.2
-up_time = 10
-epoch = 50
+b_lr =0.002
+gama=0.995
+epsilon=0.2
+up_time=10
+epoch=50
 
 Transition = namedtuple('Transition', ['state', 'ac', 'ac_prob', 'reward', 'done'])
 
@@ -47,7 +47,7 @@ def test_get_action(state, net, width, height):
     """
     # 添加批次维度并获取动作概率
     state = state.unsqueeze(dim=0)
-    action_probs = net(state)
+    action_probs = net.action(state)  # 使用PPO内部的action网络
 
     # 选择概率最高的15个动作并采样
     top_values, top_indices = action_probs.topk(k=15, dim=1)
@@ -61,10 +61,10 @@ def test_get_action(state, net, width, height):
     return coords, prob_dist
 
 
-def model_train(times, settings):
+def model_train(times, settings, difficulty):
     env = Minesweeper(difficulty=difficulty, window=False)
-    net = PPO(input_shape=[mine_settings["width"], mine_settings["height"]], up_time=up_time, batch_size=batch_size, a_lr=a_lr, b_lr=b_lr, gama=gama, epsilon=epsilon)
-    # net.load_checkpoint("net_model.pt")  # 加载上次保存的状态
+    net = PPO(input_shape=[settings["width"], settings["height"]], up_time=up_time, batch_size=batch_size, a_lr=a_lr, b_lr=b_lr, gama=gama, epsilon=epsilon)
+    net.load_checkpoint("net_model.pt")  # 加载上次保存的状态
 
     Rs = []  # 存储每一局游戏结束后的总奖励
 
@@ -75,8 +75,9 @@ def model_train(times, settings):
                 # 每局游戏的初始化与交互
                 env.reset()  # 重置游戏环境（开始新一局）
                 s = torch.tensor(env.get_status(), dtype=torch.float32)  # 获取初始状态并转为Tensor
-                # 游戏循环：直到游戏结束（踩雷或获胜）或步数超过51（防止无限循环）
-                while env.condition and env.t < 91:
+
+                # 游戏循环：直到游戏结束（踩雷或获胜）或步数超过50（防止无限循环）
+                while env.condition and env.t < 90:
                     # 智能体选择动作
                     a, a_p = net.get_action(s)  # a是动作索引，a_p是动作概率
                     at = get_action_coords(a[0], settings["width"], settings["height"])  # 将动作索引转换为游戏可理解的格式（如坐标(x,y)）
@@ -95,7 +96,7 @@ def model_train(times, settings):
                 # 更新进度条显示
                 pbar.set_postfix({'return': '%.2f' % R})  # 显示本局的总奖励
                 pbar.update(1)  # 进度条加1
-        if (net.total_episodes + 1) % 100 == 0:
+        if (i + 1) % 50 == 0:
             net.save_checkpoint("net_model.pt")
             net.plot_training_curves()
 
@@ -112,11 +113,13 @@ def model_train(times, settings):
     line.render('result.html')
 
 
-def test(path, settings):
+def test(path, settings, difficulty):
     env = Minesweeper(difficulty=difficulty, window=True)
-    net = torch.load(path, weights_only=False)
+    net = PPO(input_shape=[settings["width"], settings["height"]], up_time=up_time, batch_size=batch_size, a_lr=a_lr, b_lr=b_lr, gama=gama, epsilon=epsilon)
+    net.load_checkpoint("net_model.pt")  # 加载上次保存的状态
     device = torch.device("cpu")
-    net = net.to(device)
+    net.action = net.action.to(device)
+    net.value = net.value.to(device)
     s = torch.tensor(env.get_status(), dtype=torch.float32)
     a_p = 0
     for i in range(10):
@@ -132,9 +135,9 @@ def test(path, settings):
 
 
 if __name__ == '__main__':
-    difficulty = "简单"
-    mine_settings = DIFFICULTIES[difficulty]
-    model_train(times=20, settings=mine_settings)
+    mine_difficulty = "简单"
+    mine_settings = DIFFICULTIES[mine_difficulty]
+    model_train(times=200, settings=mine_settings, difficulty=mine_difficulty)
 
     # model_path = 'net_model.pt'
-    # test(path=model_path, settings=mine_settings)
+    # test(path=model_path, settings=mine_settings, difficulty=mine_difficulty)

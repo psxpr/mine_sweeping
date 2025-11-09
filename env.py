@@ -67,6 +67,24 @@ class Minesweeper:
         # 模式控制参数
         self.window = window  # True: 玩家模式（带界面），False: 智能体模式（无界面）
 
+        # 新增模式控制变量
+        self.mode = "player"  # 默认为玩家模式，可选：player/ai/prompt
+        self.ai_auto_running = False  # 标记AI模式是否正在自动运行
+        self.ai_prompt_pos = None  # 存储AI提示的最佳格子位置
+
+        # 右侧功能按钮配置（垂直排列）
+        self.btn_width = 120
+        self.btn_height = 40
+        self.btn_margin = 20  # 按钮间距
+        self.btn_x_offset = 20  # 按钮距右侧边缘距离
+
+        # 游戏基础设置（原有代码）
+        self.window = window
+        self.difficulty = difficulty
+        self.settings = DIFFICULTIES[self.difficulty]
+        self.cell_size = 30
+        self.header_height = 100 if self.window else 0
+
         # 游戏基础设置
         self.difficulty = difficulty
         self.settings = DIFFICULTIES[self.difficulty]
@@ -85,7 +103,8 @@ class Minesweeper:
 
         # 初始化窗口（仅玩家模式）
         if self.window:
-            self.window_width = self.settings["width"] * self.cell_size
+            self.side_btn_area_width = self.btn_width + self.btn_x_offset * 2  # 右侧按钮区域宽度
+            self.window_width = self.settings["width"] * self.cell_size + self.side_btn_area_width
             self.window_height = self.settings["height"] * self.cell_size + self.header_height
             self.screen = pygame.display.set_mode((self.window_width, self.window_height))
             pygame.display.set_caption("扫雷")
@@ -113,6 +132,11 @@ class Minesweeper:
 
     def reset(self):
         """重置游戏状态（支持玩家和智能体模式）"""
+        # 重置时同步重置模式相关变量
+        self.mode = "player"
+        self.ai_auto_running = False
+        self.ai_prompt_pos = None
+
         # 初始化格子
         self.cells = [
             [Cell(x, y) for y in range(self.settings["height"])]
@@ -149,7 +173,7 @@ class Minesweeper:
             self.hovered_restart_btn = False
 
     def set_difficulty(self, difficulty):
-        """更改游戏难度（仅玩家模式有效）"""
+        """更改游戏难度，同步调整窗口和按钮位置"""
         if difficulty in DIFFICULTIES and difficulty != self.difficulty:
             self.difficulty = difficulty
             self.settings = DIFFICULTIES[difficulty]
@@ -158,13 +182,18 @@ class Minesweeper:
             self.count = np.zeros([self.settings["width"], self.settings["height"]])
             self.map = np.zeros([self.settings["width"], self.settings["height"]])
 
-            # 玩家模式更新窗口
+            # 玩家模式：重新计算窗口宽度（网格宽度 + 右侧按钮区域宽度）
             if self.window:
-                self.window_width = self.settings["width"] * self.cell_size
+                # 网格宽度 = 格子数 × 格子大小
+                grid_width = self.settings["width"] * self.cell_size
+                # 窗口总宽度 = 网格宽度 + 右侧按钮区域宽度（之前定义的side_btn_area_width）
+                self.window_width = grid_width + self.side_btn_area_width
+                # 窗口高度 = 网格高度 + 头部高度（网格高度 = 格子行数 × 格子大小）
                 self.window_height = self.settings["height"] * self.cell_size + self.header_height
+                # 重新创建窗口（应用新尺寸）
                 self.screen = pygame.display.set_mode((self.window_width, self.window_height))
 
-            self.reset()
+            self.reset()  # 重置游戏状态（包括模式变量）
 
     def place_mines(self, first_click_x, first_click_y):
         """在第一次点击后放置地雷"""
@@ -277,11 +306,11 @@ class Minesweeper:
                         if safety_prob[x][y] == 1.0:
                             safety_prob[x][y] = isolated_prob
 
-        # 已翻开/已标记的格子安全概率设为-1（无效区域）
-        for x in range(width):
-            for y in range(height):
-                if revealed[x][y] or marked[x][y]:
-                    safety_prob[x][y] = -1.0
+        # # 已翻开/已标记的格子安全概率设为-1（无效区域）
+        # for x in range(width):
+        #     for y in range(height):
+        #         if revealed[x][y] or marked[x][y]:
+        #             safety_prob[x][y] = -1.0
 
         self.safety_prob_cache = safety_prob  # 缓存结果
 
@@ -558,32 +587,103 @@ class Minesweeper:
 
         return restart_btn
 
+    # 绘制右侧功能按钮
+    def draw_side_buttons(self):
+        if not self.window:
+            return []
+
+        buttons = []
+        # 按钮文本与对应模式
+        btn_configs = [
+            ("玩家模式", "player"),
+            ("AI模式", "ai"),
+            ("AI提示", "prompt")
+        ]
+        # 计算第一个按钮的起始y坐标（垂直居中对齐）
+        start_y = (self.window_height - (self.btn_height * 3 + self.btn_margin * 2)) // 2
+
+        for idx, (text, mode) in enumerate(btn_configs):
+            btn_y = start_y + idx * (self.btn_height + self.btn_margin)
+            btn_rect = pygame.Rect(
+                self.window_width - self.btn_width - self.btn_x_offset,
+                btn_y,
+                self.btn_width,
+                self.btn_height
+            )
+            buttons.append((btn_rect, mode))
+
+            # 按钮颜色逻辑：当前模式高亮，悬停变色
+            if self.mode == mode:
+                btn_color = GREEN
+            elif btn_rect.collidepoint(pygame.mouse.get_pos()):
+                btn_color = BUTTON_HOVER
+            else:
+                btn_color = BUTTON_BG
+
+            # 绘制按钮
+            pygame.draw.rect(self.screen, btn_color, btn_rect, border_radius=5)
+            pygame.draw.rect(self.screen, DARK_GRAY, btn_rect, 1, border_radius=5)
+            # 绘制按钮文本
+            btn_text = medium_font.render(text, True, BLACK)
+            text_rect = btn_text.get_rect(center=btn_rect.center)
+            self.screen.blit(btn_text, text_rect)
+
+        return buttons
+
     def draw(self):
         """绘制完整游戏界面（仅玩家模式）"""
         if not self.window:
-            return None, None, None, None
+            return None, None, None, None, []
 
         self.screen.fill(WHITE)
         # 绘制头部信息栏并获取按钮区域
         easy_rect, medium_rect, hard_rect = self.draw_header()
         # 绘制网格
         self.draw_grid()
+        # 绘制右侧功能按钮并获取按钮区域
+        side_buttons = self.draw_side_buttons()
         # 绘制结果弹窗（如果游戏结束）
         restart_btn = self.draw_game_result() if (self.game_over or self.victory) else None
-
         pygame.display.flip()
-        return easy_rect, medium_rect, hard_rect, restart_btn
+        return easy_rect, medium_rect, hard_rect, restart_btn, side_buttons
 
     # ---------------------- 智能体交互核心方法 ----------------------
+    # 加载AI模型并获取最佳动作
+    def get_ai_best_action(self, model_path="net_model.pt"):
+        """加载训练好的模型，返回当前状态下的最佳点击位置"""
+        try:
+            # 加载模型
+            net = torch.load(model_path, weights_only=False)
+            net.eval()
+            device = torch.device("cpu")
+            net = net.to(device)
+
+            # 获取当前状态并转换格式
+            state = torch.tensor(self.get_status(), dtype=torch.float32).unsqueeze(dim=0)
+            action_probs = net(state)
+
+            # 选择概率最高的动作
+            best_action_idx = torch.argmax(action_probs).item()
+            width = self.settings["width"]
+            x = best_action_idx // width
+            y = best_action_idx % width
+            return x, y
+        except Exception as e:
+            print(f"AI提示获取失败：{e}")
+            return None
+
     def get_status(self):
         """获取智能体观察的环境状态（三维数组：[3, H, W], 对应着3层：[状态层, 点击计数层, 安全概率层]）"""
         # 状态层：未翻开=-1，已翻开地雷=-10，已翻开安全区=周围地雷数
         status_layer = (np.array([[cell.is_revealed for cell in row]
                                   for row in self.cells], dtype=np.float64) - 1) + self.map
+        status_layer = status_layer / 10  # 归一化
         # 计算安全概率层
         safety_layer = self.calculate_safety_prob()
+        # 点击计数层
+        count_layer = self.count / self.count.max() if self.count.max() != 0 else self.count  # 点击次数归一化
         # 堆叠状态层,点击计数层,安全概率层（便于智能体观察历史行为）
-        status = np.stack((status_layer, self.count, safety_layer), axis=0)
+        status = np.stack((status_layer, count_layer, safety_layer), axis=0)
         return status
 
     def agent_step(self, action):
@@ -598,11 +698,17 @@ class Minesweeper:
         # 过滤绝对雷区动作（安全概率≤0.0）
         if self.mines_placed:
             if safety_prob <= 0.0:
-                self.r = -1.0
+                self.r = -15.0
                 self.t += 1
                 self.R.append(self.r)
                 self.actions.append((x, y))
                 return self._agent_return()
+
+        # 1. 边界校验惩罚（无效动作）
+        if not (0 <= x < self.settings["width"] and 0 <= y < self.settings["height"]):
+            self.r = -8.0
+            self.condition = False
+            return self._agent_return()
 
         if self.window:
             # 记录当前点击位置（用于高亮）
@@ -612,18 +718,12 @@ class Minesweeper:
             self.update_time()
             self.draw()
 
-        # 1. 边界校验惩罚（无效动作）
-        if not (0 <= x < self.settings["width"] and 0 <= y < self.settings["height"]):
-            self.r = -2.0
-            self.condition = False
-            return self._agent_return()
-
         cell = self.cells[x][y]
         # 2. 已翻开/已标记格子点击惩罚（避免无效探索）
         if cell.is_revealed or cell.mark_type != 0:
-            self.r = -1.0
+            self.r = -5.0
             if self.count[x][y] > 0:
-                self.r -= 0.3 * self.count[x][y]  # 重复次数越多，惩罚越重
+                self.r -= 2 * self.count[x][y]  # 重复次数越多，惩罚越重
 
             self.t += 1
             self.count[x][y] += 1
@@ -637,8 +737,11 @@ class Minesweeper:
             self.place_mines(x, y)
             safety_prob = 1.0  # 首步点击的格子绝对安全
 
-        # 4. 执行翻开操作（智能体模式）
+        # 记录翻开前后的安全格子数，计算新增解锁数
+        revealed_before = sum(1 for row in self.cells for c in row if not c.is_mine and c.is_revealed)
         self.reveal_cell(x, y, is_agent=True)
+        revealed_after = sum(1 for row in self.cells for c in row if not c.is_mine and c.is_revealed)
+        new_revealed = revealed_after - revealed_before
 
         # 5. 计算当前已翻开的安全格子数（排除地雷）
         revealed_safe = sum(
@@ -654,19 +757,16 @@ class Minesweeper:
 
         # 6. 核心奖励逻辑：分阶段奖励（完全胜利 > 接近胜利 > 安全探索）
         if not self.game_over:  # 未踩雷时才给正向奖励
-            # 6.1 安全翻开新格子的基础奖励
-            self.r = 0.8  # 基础探索奖励
+            # 安全翻开新格子的基础奖励
+            self.r = 1.5  # 基础探索奖励
 
-            # 6.2 信息价值奖励（高数字格子提供更多线索）
-            self.r += cell.adjacent_mines * 0.3
-
-            # 6.3 安全概率奖励（核心新增：鼓励选择高安全概率格子）
+            # 安全概率奖励（核心新增：鼓励选择高安全概率格子）
             if safety_prob >= 1.0:  # 绝对安全格子（优先选择）
-                self.r += 1.5  # 额外高额奖励
+                self.r += 3.0  # 额外高额奖励
             elif safety_prob >= 0.8:  # 高安全概率
-                self.r += 0.8
+                self.r += 1.5
             elif safety_prob >= 0.5:  # 中等安全概率
-                self.r += 0.3
+                self.r += 0.5
             else:  # 低安全概率（冒险行为）
                 self.r -= 2.0  # 惩罚冒险
 
@@ -677,37 +777,33 @@ class Minesweeper:
             if safe_cells > 0 and safety_prob < 0.5:
                 self.r -= 5.0  # 有高安全格子却冒险，追加惩罚
 
-            # 阶段性奖励动态阈值（按难度调整）
-            if self.difficulty == "简单":
-                threshold = max(1, int(total_safe * 0.2))  # 简单难度阈值20%，更容易触发
-            elif self.difficulty == "中等":
-                threshold = max(1, int(total_safe * 0.15))
-            else:
-                threshold = max(1, int(total_safe * 0.1))
 
-            # 一次性阶段性奖励
-            if not self.stage_reward and (total_safe - threshold) <= revealed_safe < total_safe:
-                self.r += 20.0  # 接近胜利的额外奖励（比完全胜利低，留提升空间）
-                self.stage_reward = True
+
+            # 空白格子解锁奖励
+            if cell.adjacent_mines == 0:
+                # 新增格子数越多，奖励越高（原0.3→0.5）
+                self.r += new_revealed * 0.5  # 基础奖励+解锁奖励
+            else:
+                self.r += cell.adjacent_mines * 0.3  # 数字格子奖励提升
 
             # 进度奖励：每达到20%进度且未奖励过，则追加奖励
             if progress >= 0.2 and not self.stage_reward["20%"]:
                 self.r += 5.0  # 20%进度奖励
                 self.stage_reward["20%"] = True  # 标记为已奖励
             if progress >= 0.4 and not self.stage_reward["40%"]:
-                self.r += 5.0  # 40%进度奖励
+                self.r += 8.0  # 40%进度奖励
                 self.stage_reward["40%"] = True
             if progress >= 0.6 and not self.stage_reward["60%"]:
-                self.r += 5.0  # 60%进度奖励
+                self.r += 12.0  # 60%进度奖励
                 self.stage_reward["60%"] = True
             if progress >= 0.8 and not self.stage_reward["80%"]:
-                self.r += 5.0  # 80%进度奖励
+                self.r += 18.0  # 80%进度奖励
                 self.stage_reward["80%"] = True
 
         # 7. 终局状态处理（完全胜利/踩雷失败）
         if self.game_over:  # 踩雷失败：重惩罚
             print("踩雷了，游戏失败！")
-            self.r = -50.0
+            self.r = -15.0
             self.condition = False
             # 智能体窗口模式下，延时1秒重启
             if self.window:
@@ -720,17 +816,14 @@ class Minesweeper:
             self.r = 100.0 + (self.settings["width"] * self.settings["height"] - self.t) * 0.05  # 快速胜利加成
             self.condition = False
 
-        # 8. 重复点击惩罚（累积惩罚）
-        if self.count[x][y] > 0:
-            self.r -= 0.3 * self.count[x][y]  # 重复次数越多，惩罚越重（如第2次-0.6，第3次-0.9）
-
         # 9. 步数限制（防止无限循环，适配难度）
         self.t += 1
         self.count[x][y] += 1  # 记录点击次数
-        max_steps = max(100, total_safe * 1)  # 最大步数=安全格子数×2（保证足够探索时间）
+        max_steps = 90
         if self.t >= max_steps:
-            self.r = -5.0
+            self.r = -8.0
             self.condition = False
+            print("步数限制")
 
         # 记录奖励和动作
         self.R.append(self.r)
@@ -748,20 +841,47 @@ class Minesweeper:
 
     # ---------------------- 主循环 ----------------------
     def run(self):
-        """玩家模式主循环"""
         if not self.window:
             print("请使用window=True启用玩家模式")
             return
 
         running = True
+        # 预加载AI模型（优化性能）
+        self.ai_model_path = "net_model.pt"
+
         while running:
-            self.clock.tick(30)  # 30FPS
+            self.clock.tick(30)
             self.update_time()
 
-            # 绘制界面并获取按钮区域
-            easy_rect, medium_rect, hard_rect, restart_btn = self.draw()
+            # 绘制界面，获取所有按钮区域
+            easy_rect, medium_rect, hard_rect, restart_btn, side_buttons = self.draw()
 
-            # 事件处理
+            # ------------ AI模式自动运行逻辑 ------------
+            if self.mode == "ai" and not self.ai_auto_running and not self.game_over and not self.victory:
+                self.ai_auto_running = True
+                # 启动AI自动扫雷
+                while self.condition and not self.game_over and not self.victory:
+                    best_action = self.get_ai_best_action(self.ai_model_path)
+                    if best_action:
+                        x, y = best_action
+                        # 执行AI动作
+                        if not self.mines_placed:
+                            self.place_mines(x, y)
+                        self.reveal_cell(x, y)
+                        self.check_victory()
+
+                        # 刷新界面
+                        self.draw()
+                        pygame.time.delay(500)  # 延迟500ms，便于观察
+                    else:
+                        break
+                # AI局结束，自动切回玩家模式
+                self.mode = "player"
+                self.ai_auto_running = False
+                # 停留2秒显示结果
+                pygame.time.delay(2000)
+
+            # ------------ 事件处理 ------------
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -769,12 +889,29 @@ class Minesweeper:
                 if event.type == pygame.MOUSEBUTTONDOWN:
                     x, y = pygame.mouse.get_pos()
 
-                    # 游戏结束状态：处理重新开始按钮
+                    # 1. 重新开始按钮处理（原有）
                     if (self.game_over or self.victory) and restart_btn and restart_btn.collidepoint(x, y):
                         self.reset()
                         continue
 
-                    # 游戏中：处理难度按钮
+                    # 2. 右侧功能按钮处理
+                    btn_clicked = False
+                    for btn_rect, mode in side_buttons:
+                        if btn_rect.collidepoint(x, y):
+                            self.mode = mode
+                            # AI提示模式：获取最佳位置并高亮
+                            if mode == "prompt":
+                                self.ai_prompt_pos = self.get_ai_best_action(self.ai_model_path)
+                                # 高亮提示位置（复用原有agent_current_click的高亮逻辑）
+                                self.agent_current_click = self.ai_prompt_pos
+                            else:
+                                self.agent_current_click = None  # 取消高亮
+                            btn_clicked = True
+                            break
+                    if btn_clicked:
+                        continue
+
+                    # 3. 难度按钮处理
                     if not self.game_over and not self.victory and y < self.header_height:
                         if easy_rect and easy_rect.collidepoint(x, y):
                             self.set_difficulty("简单")
@@ -784,18 +921,19 @@ class Minesweeper:
                             self.set_difficulty("困难")
                         continue
 
-                    # 游戏中：处理格子点击
-                    if not self.game_over and not self.victory:
+                    # 4. 玩家模式格子点击（仅玩家模式生效）
+                    if self.mode == "player" and not self.game_over and not self.victory:
                         grid_x = x // self.cell_size
                         grid_y = (y - self.header_height) // self.cell_size
-
-                        if event.button == 1:  # 左键：翻开格子
-                            if not self.mines_placed:
-                                self.place_mines(grid_x, grid_y)
-                            self.reveal_cell(grid_x, grid_y)
-                            self.check_victory()  # 检查是否胜利
-                        elif event.button == 3:  # 右键：标记格子
-                            self.toggle_mark(grid_x, grid_y)
+                        # 过滤右侧按钮区域的点击
+                        if grid_x < self.settings["width"]:
+                            if event.button == 1:
+                                if not self.mines_placed:
+                                    self.place_mines(grid_x, grid_y)
+                                self.reveal_cell(grid_x, grid_y)
+                                self.check_victory()
+                            elif event.button == 3:
+                                self.toggle_mark(grid_x, grid_y)
 
         pygame.quit()
         sys.exit()

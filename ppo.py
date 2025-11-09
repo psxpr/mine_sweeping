@@ -13,78 +13,71 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 # 策略网络
+# 残差块（Residual Block）
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU()
+
+        # 残差连接（如果输入输出维度不同，用 1x1 卷积调整）
+        if in_channels != out_channels or stride != 1:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+# 策略网络（使用 ResNet）
 class PolicyNet(nn.Module):
-    """卷积神经网络策略网络（适用于网格类状态，如扫雷）
-    优化点：使用 nn.Flatten() 替代手动 view 展平，移除类型注解简化代码
-    """
-
-    def __init__(
-            self,
-            input_shape=(10, 10),  # 网格尺寸 (高, 宽)
-            in_channels=3  # 输入通道数（扫雷：状态通道+数字通道+安全概率）
-    ):
+    def __init__(self, input_shape=[10, 10]):
         super(PolicyNet, self).__init__()
-        self.input_shape = input_shape
-        self.in_channels = in_channels
-
-        # 卷积特征提取 + 展平层（一体化设计）
-        self.features = nn.Sequential(
-            # 第一层卷积：提取基础空间特征
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=32,
-                kernel_size=3,
-                stride=1,
-                padding=1  # 保持特征图尺寸与输入一致
-            ),
-            nn.ReLU(inplace=True),  # inplace=True 节省内存
-
-            # 第二层卷积：加深特征提取
-            nn.Conv2d(32, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-
-            # 第三层卷积：压缩特征通道
-            nn.Conv2d(128, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-
-            # 输出层卷积：将通道数压缩至1（对应动作概率的空间分布）
-            nn.Conv2d(32, 1, kernel_size=3, stride=1, padding=1),
-
-            # 展平层：将 (batch, 1, H, W) 展平为 (batch, 1*H*W)
-            nn.Flatten(start_dim=1)
+        self.input_dim = input_shape
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(in_channels=3, out_channels=32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=32, out_channels=128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=128, out_channels=32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=32, out_channels=1, kernel_size=3, stride=1, padding=1),
         )
-
-        # 动作概率归一化
         self.softmax = nn.Softmax(dim=1)
+        self.relu = nn.ReLU()
 
     def forward(self, x):
-        """前向传播：输入状态 -> 卷积特征提取 -> 展平 -> 动作概率分布"""
-        # 特征提取 + 展平
-        x = self.features(x)  # 输出形状：(batch_size, H*W)
-
-        # 概率归一化
-        action_probs = self.softmax(x)
-
-        return action_probs
+        x = self.conv_layers(x).view(x.shape[0], -1)
+        out = self.softmax(x)
+        return out
 
 
-# 价值网络
 class ValueNet(nn.Module):
-    def __init__(self, input_shape=(10, 10), in_channels=3):
+    def __init__(self):
         super(ValueNet, self).__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(64 * input_shape[0] * input_shape[1], 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
+        self.relu = nn.ReLU()
+        self.liner = nn.Linear(300, 256)
+        self.liner2 = nn.Linear(256, 512)
+        self.liner3 = nn.Linear(512, 1)
 
     def forward(self, x):
-        return self.features(x)
+        x = x.view(x.shape[0], -1)
+        x = self.relu(self.liner(x))
+        x = self.relu(self.liner2(x))
+        out = self.liner3(x)
+        return out
 
 
 class PPO():
@@ -96,7 +89,7 @@ class PPO():
         self.suffer = []  # 经验回放缓冲区（存储状态、动作、奖励等）
         self.action = PolicyNet(input_shape)  # 动作网络
         self.action.to(device)
-        self.value = ValueNet(input_shape)  # 价值网络
+        self.value = ValueNet()  # 价值网络
         self.value.to(device)
         self.action_optim = torch.optim.Adam(self.action.parameters(), lr=a_lr)  # 动作网络优化器
         self.value_optim = torch.optim.Adam(self.value.parameters(), lr=b_lr)  # 价值网络优化器
@@ -109,6 +102,11 @@ class PPO():
         self.update_count = 0  # 更新次数计数器
         self.total_episodes = 0  # 总训练回合数
         self.total_steps = 0  # 总训练步数
+
+        # 探索策略参数
+        self.explore_epsilon = 0.3  # 初始探索概率
+        self.explore_epsilon_min = 0.05  # 最小探索概率
+        self.explore_epsilon_decay = 0.995  # 每轮衰减系数
 
     def append(self, buffer):
         self.suffer.append(buffer)  # 将单条经验（状态、动作、奖励等）加入缓冲区
@@ -152,7 +150,10 @@ class PPO():
             print(f"未找到 {path}，将从头开始训练")
             return
 
-        checkpoint = torch.load(path, map_location=device)
+        # 允许加载defaultdict（仅信任的checkpoint使用）
+        with torch.serialization.safe_globals([defaultdict]):
+            # 禁用weights_only，允许加载完整数据
+            checkpoint = torch.load(path, map_location=device, weights_only=False)
 
         # 恢复模型参数
         self.action.load_state_dict(checkpoint["action_state_dict"])
@@ -169,17 +170,22 @@ class PPO():
         self.update_count = checkpoint["update_count"]
         self.logs = checkpoint["logs"]
 
-        # 恢复随机种子状态
-        torch.random.set_rng_state(checkpoint["rng_state"])
+        # # 恢复随机种子状态
+        # rng_state = checkpoint["rng_state"]
+        # if not isinstance(rng_state, torch.ByteTensor):
+        #     rng_state = torch.tensor(rng_state, dtype=torch.uint8)
+        #
+        # torch.random.set_rng_state(rng_state)
 
         print(f"已加载 checkpoint 从 {path}，继续训练：回合数 {self.total_episodes}，总步数 {self.total_steps}")
 
     def get_action(self, x):
-        x = x.unsqueeze(dim=0).to(device)  # 扩展为batch维度 [1, 2, H, W]
-        ac_prob = self.action(x)  # 得到动作概率分布 [1, N]（N为动作数）
-        a = Categorical(ac_prob).sample()[0]  # 按概率分布采样动作
-        ac_pro = ac_prob[0][a]  # 记录该动作的概率
-        return [a.item()], [ac_pro.item()]  # 返回动作和对应的概率
+        # 模型预测动作
+        x = x.unsqueeze(dim=0).to(device)
+        ac_prob = self.action(x)
+        a = Categorical(ac_prob).sample()[0]
+        ac_pro = ac_prob[0][a]
+        return [a.item()], [ac_pro.item()]
 
     def update(self):
         if not self.suffer:
@@ -231,17 +237,19 @@ class PPO():
                 v = self.value(torch.index_select(states, 0, index))
 
                 # 计算优势函数
-                adta = v_target - v
-                adta_detach = adta.detach()
+                advantage = v_target - v
+                # 优势标准化：加速收敛
+                advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+                advantage_detach = advantage.detach()
 
                 # 计算策略损失
                 probs = self.action(torch.index_select(states, 0, index))
                 pro_index = torch.index_select(actions, 0, index).to(torch.int64)
                 probs_a = torch.gather(probs, 1, pro_index)
-                ratio = probs_a / torch.index_select(old_probs, 0, index).to(device)
+                ratio = probs_a / (torch.index_select(old_probs, 0, index).to(device) + 1e-8)
 
-                surr1 = ratio * adta_detach
-                surr2 = torch.clip(ratio, 1 - self.epsilon, 1 + self.epsilon) * adta_detach
+                surr1 = ratio * advantage_detach
+                surr2 = torch.clip(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantage_detach
                 action_loss = -torch.mean(torch.minimum(surr1, surr2))
 
                 # 更新策略网络
@@ -258,7 +266,7 @@ class PPO():
                 # 累计统计信息
                 total_action_loss += action_loss.item()
                 total_value_loss += value_loss.item()
-                total_advantage += torch.mean(torch.abs(adta)).item()
+                total_advantage += torch.mean(torch.abs(advantage)).item()
                 total_ratio += torch.mean(ratio).item()
 
                 # 记录每步更新的损失
