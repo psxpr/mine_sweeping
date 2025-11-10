@@ -1,12 +1,9 @@
 from collections import namedtuple
-
-import time
-
 from env import Minesweeper, DIFFICULTIES
 from ppo import PPO
 from tqdm import tqdm
 from torch.distributions.categorical import Categorical
-from pyecharts.charts import Line
+import matplotlib.pyplot as plt
 import torch
 import numpy as np
 
@@ -14,8 +11,8 @@ import numpy as np
 batch_size = 32
 a_lr = 0.0001
 b_lr = 0.002
-gama = 0.995
-epsilon = 0.2
+gama = 0.99
+epsilon = 0.15
 up_time = 10
 epoch = 50
 
@@ -32,25 +29,13 @@ def get_action_coords(action_idx, width, height):
 
 
 def test_get_action(state, net, width, height):
-    """
-    测试阶段获取动作和概率分布
-
-    参数:
-        state: 当前游戏状态
-        net: 神经网络模型
-        width: 网格宽度
-        height: 网格高度
-
-    返回:
-        (x, y): 动作坐标
-        prob_dist: 概率分布
-    """
+    """测试阶段获取动作和概率分布"""
     # 添加批次维度并获取动作概率
     state = state.unsqueeze(dim=0)
-    action_probs = net(state)
+    action_probs = net.action(state)
 
     # 选择概率最高的15个动作并采样
-    top_values, top_indices = action_probs.topk(k=15, dim=1)
+    top_values, top_indices = action_probs.topk(k=3, dim=1)
     selected_idx = Categorical(top_values).sample()[0].item()
     action_idx = top_indices[0, selected_idx].item()
 
@@ -64,7 +49,7 @@ def test_get_action(state, net, width, height):
 def model_train(times, settings):
     env = Minesweeper(difficulty=difficulty, window=False)
     net = PPO(input_shape=[mine_settings["width"], mine_settings["height"]], up_time=up_time, batch_size=batch_size, a_lr=a_lr, b_lr=b_lr, gama=gama, epsilon=epsilon)
-    # net.load_checkpoint("net_model.pt")  # 加载上次保存的状态
+    net.load_checkpoint("net_model.pt")  # 加载上次保存的状态
 
     Rs = []  # 存储每一局游戏结束后的总奖励
 
@@ -95,46 +80,64 @@ def model_train(times, settings):
                 # 更新进度条显示
                 pbar.set_postfix({'return': '%.2f' % R})  # 显示本局的总奖励
                 pbar.update(1)  # 进度条加1
-        if (net.total_episodes + 1) % 100 == 0:
+        if (i + 1) % 100 == 0:
             net.save_checkpoint("net_model.pt")
             net.plot_training_curves()
 
-    torch.save(net.action,'net_model.pt')
+    net.save_checkpoint("net_model.pt")
     net.plot_training_curves()
-    Re = []
-    for i in range(int(len(Rs)/50)):
-        idx = i*50
-        Re.append(sum(Rs[idx:idx+50])/50)
-    x = [str(i) for i in range(len(Re))]
-    line = Line()
-    line.add_xaxis(xaxis_data=x)
-    line.add_yaxis(y_axis=Re, series_name='Recall')
-    line.render('result.html')
 
 
 def test(path, settings):
-    env = Minesweeper(difficulty=difficulty, window=True)
-    net = torch.load(path, weights_only=False)
+    env = Minesweeper(difficulty=difficulty, window=False)
+    net = PPO(input_shape=[mine_settings["width"], mine_settings["height"]], up_time=up_time, batch_size=batch_size,
+              a_lr=a_lr, b_lr=b_lr, gama=gama, epsilon=epsilon)
+    net.load_checkpoint("net_model.pt")  # 加载上次保存的状态
+
     device = torch.device("cpu")
-    net = net.to(device)
+    net.action = net.action.to(device)
+    net.value = net.value.to(device)
     s = torch.tensor(env.get_status(), dtype=torch.float32)
     a_p = 0
-    for i in range(10):
+
+    win_rates = []
+    win_rate_window = 10
+    for i in range(1000):
         k = 0
         while env.condition:
             a, a_p = test_get_action(s, net, width=settings["width"], height=settings["height"])
             [s_t, r, d] = env.agent_step(a)
-            print("第{}步：动作a = {}, 奖励r = {}".format(k, a, r))
+            # print("第{}步：动作a = {}, 奖励r = {}".format(k, a, r))
             k = k + 1
             s = s_t
-            time.sleep(1.)
+            # time.sleep(1.)
         env.reset()
+
+        if (i + 1) % win_rate_window == 0:
+            win_rates.append(env.win_count / (i + 1))
+
+    plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei", "SimSun"]
+    plt.figure(figsize=(12, 6))
+    # 绘制原始胜率曲线
+    game_numbers = [i * win_rate_window for i in range(1, len(win_rates) + 1)]  # 局数按3递增
+    plt.plot(game_numbers, win_rates, label=f'胜率变化', color='blue')
+
+    # 图表设置
+    plt.title('PPO扫雷智能体胜率变化曲线', fontsize=14)
+    plt.xlabel('训练局数', fontsize=12)
+    plt.ylabel('胜率', fontsize=12)
+    plt.ylim(0, 1.05)  # 胜率范围0-1
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+    plt.show()
 
 
 if __name__ == '__main__':
     difficulty = "简单"
     mine_settings = DIFFICULTIES[difficulty]
-    model_train(times=20, settings=mine_settings)
+    # model_train(times=100, settings=mine_settings)
 
-    # model_path = 'net_model.pt'
-    # test(path=model_path, settings=mine_settings)
+    # 模型测试，绘制模型每进行10局扫雷的胜率变化
+    model_path = 'net_model.pt'
+    test(path=model_path, settings=mine_settings)

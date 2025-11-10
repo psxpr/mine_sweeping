@@ -14,10 +14,6 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # 策略网络
 class PolicyNet(nn.Module):
-    """卷积神经网络策略网络（适用于网格类状态，如扫雷）
-    优化点：使用 nn.Flatten() 替代手动 view 展平，移除类型注解简化代码
-    """
-
     def __init__(
             self,
             input_shape=(10, 10),  # 网格尺寸 (高, 宽)
@@ -58,7 +54,6 @@ class PolicyNet(nn.Module):
         self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x):
-        """前向传播：输入状态 -> 卷积特征提取 -> 展平 -> 动作概率分布"""
         # 特征提取 + 展平
         x = self.features(x)  # 输出形状：(batch_size, H*W)
 
@@ -146,13 +141,13 @@ class PPO():
         torch.save(checkpoint, path)
         print(f"已保存 checkpoint 到 {path}，回合数：{self.total_episodes}，总步数：{self.total_steps}")
 
-    def load_checkpoint(self, path="checkpoint.pt"):
+    def load_checkpoint(self, path="checkpoint.pt", train=True):
         """加载模型 checkpoint（续训入口）"""
         if not os.path.exists(path):
             print(f"未找到 {path}，将从头开始训练")
             return
 
-        checkpoint = torch.load(path, map_location=device)
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
 
         # 恢复模型参数
         self.action.load_state_dict(checkpoint["action_state_dict"])
@@ -170,9 +165,9 @@ class PPO():
         self.logs = checkpoint["logs"]
 
         # 恢复随机种子状态
-        torch.random.set_rng_state(checkpoint["rng_state"])
-
-        print(f"已加载 checkpoint 从 {path}，继续训练：回合数 {self.total_episodes}，总步数 {self.total_steps}")
+        # torch.random.set_rng_state(checkpoint["rng_state"])
+        if train:
+            print(f"已加载 checkpoint 从 {path}，继续训练：回合数 {self.total_episodes}，总步数 {self.total_steps}")
 
     def get_action(self, x):
         x = x.unsqueeze(dim=0).to(device)  # 扩展为batch维度 [1, 2, H, W]
@@ -185,38 +180,45 @@ class PPO():
         if not self.suffer:
             return
 
+        # 原有逻辑：提取经验池中的状态、动作、奖励等基础数据
         states = torch.stack([t.state for t in self.suffer], dim=0).to(device)
         actions = torch.tensor([t.ac for t in self.suffer], dtype=torch.int).to(device)
         rewards = [t.reward for t in self.suffer]
         done = [t.done for t in self.suffer]
         old_probs = torch.tensor([t.ac_prob for t in self.suffer], dtype=torch.float32).to(device)  # .detach()
 
-        reward_all = []
-        start_idx = 0  # 记录当前episode的起始索引
-        for i in range(len(done)):
-            if i == len(done) - 1 or done[i]:  # 到达末尾或episode结束
-                episode_rewards = rewards[start_idx:i + 1]  # 提取当前episode的所有奖励
-                R = 0
-                episode_returns = []
-                for r in reversed(episode_rewards):  # 从后向前计算折扣回报
-                    R = r + self.gama * R
-                    episode_returns.append(R)
-                reward_all.extend(reversed(episode_returns))  # 保持时间顺序
-                start_idx = i + 1  # 移动到下一个episode的起始位置
-        # 如果最后一个 episode 未终止，强制截断
-        if start_idx < len(rewards):
-            episode_rewards = rewards[start_idx:]
-            R = 0
-            episode_returns = []
-            for r in reversed(episode_rewards):
-                R = r + self.gama * R
-                episode_returns.append(R)
-            reward_all.extend(reversed(episode_returns))
+        # ---------------------- 用TD(λ)计算平滑的价值目标 ----------------------
+        # 先获取当前价值网络的预测值（用于GAE计算）
+        Vs = self.value(states).squeeze().detach().cpu().numpy()
+        Rs = np.zeros_like(Vs)
+        gae = 0.0
+        lambda_ = 0.95  # GAE衰减系数
+        for t in reversed(range(len(rewards))):
+            # 处理episode终止的边界情况
+            if t == len(rewards) - 1 or done[t]:
+                delta = rewards[t] - Vs[t]
+            else:
+                delta = rewards[t] + self.gama * Vs[t + 1] - Vs[t]
+            # 累积GAE优势
+            gae = delta + self.gama * lambda_ * gae * (1 - done[t])
+            Rs[t] = gae + Vs[t]  # 平滑后的价值目标
+        # 转换为张量
+        Rs = torch.tensor(Rs, dtype=torch.float32).to(device)
 
-        # 更新网络
+        # ----------------------多维度优先级采样 ----------------------
+        # 计算各维度优先级（TD误差、奖励绝对值、动作熵）
+        td_errors = torch.abs(Rs - self.value(states).squeeze()).detach().cpu().numpy()
+        reward_magnitude = np.abs(np.array(rewards))
+        # 计算动作熵（探索性）
+        action_probs = self.action(states).detach().cpu().numpy()
+        action_entropy = -np.sum(action_probs * np.log(action_probs + 1e-8), axis=1)
+        # 多维度加权得到最终优先级
+        priorities = 0.5 * td_errors + 0.3 * reward_magnitude + 0.2 * action_entropy
+        priorities = priorities + 1e-5  # 避免零优先级
+        priorities = priorities / priorities.sum()  # 归一化
+
         self.action.train()
         self.value.train()
-        Rs = torch.tensor(reward_all, dtype=torch.float32).to(device)
 
         total_action_loss = 0
         total_value_loss = 0
@@ -224,46 +226,66 @@ class PPO():
         total_ratio = 0
 
         for _ in range(self.up_time):
-            for n in range(max(10, int(10 * len(self.suffer) / self.batch_size))):
-                index = torch.tensor(random.sample(range(len(self.suffer)), self.batch_size),
-                                     dtype=torch.int64).to(device)
-                v_target = torch.index_select(Rs, dim=0, index=index).unsqueeze(dim=1)
-                v = self.value(torch.index_select(states, 0, index))
+            # 按多维度优先级采样
+            batch_indices = np.random.choice(
+                len(self.suffer),
+                size=self.batch_size,
+                p=priorities
+            )
+            batch_indices = torch.tensor(batch_indices, dtype=torch.int64).to(device)
 
-                # 计算优势函数
-                adta = v_target - v
-                adta_detach = adta.detach()
+            # 原有批次数据提取逻辑
+            v_target = torch.index_select(Rs, dim=0, index=batch_indices).unsqueeze(dim=1)
+            v = self.value(torch.index_select(states, 0, index=batch_indices))
 
-                # 计算策略损失
-                probs = self.action(torch.index_select(states, 0, index))
-                pro_index = torch.index_select(actions, 0, index).to(torch.int64)
-                probs_a = torch.gather(probs, 1, pro_index)
-                ratio = probs_a / torch.index_select(old_probs, 0, index).to(device)
+            # 计算优势函数
+            adta = v_target - v
+            adta_detach = adta.detach()
 
-                surr1 = ratio * adta_detach
-                surr2 = torch.clip(ratio, 1 - self.epsilon, 1 + self.epsilon) * adta_detach
-                action_loss = -torch.mean(torch.minimum(surr1, surr2))
+            # 计算策略损失
+            probs = self.action(torch.index_select(states, 0, index=batch_indices))
+            pro_index = torch.index_select(actions, 0, index=batch_indices).to(torch.int64)
+            probs_a = torch.gather(probs, 1, pro_index)
+            ratio = probs_a / torch.index_select(old_probs, 0, index=batch_indices).to(device)
 
-                # 更新策略网络
-                self.action_optim.zero_grad()
-                action_loss.backward(retain_graph=True)
-                self.action_optim.step()
+            # 动态调整Clip参数
+            avg_ratio = torch.mean(ratio).item()
+            # 若策略更新过于保守，增大epsilon；若超出范围，减小epsilon
+            if avg_ratio > 0.98 and avg_ratio < 1.02:
+                self.epsilon = min(0.2, self.epsilon * 1.05)  # 上限0.2
+            elif avg_ratio < (1 - self.epsilon) or avg_ratio > (1 + self.epsilon):
+                self.epsilon = max(0.05, self.epsilon * 0.95)  # 下限0.05
 
-                # 计算并更新价值网络
-                value_loss = self.loss(v_target, v)
-                self.value_optim.zero_grad()
-                value_loss.backward()
-                self.value_optim.step()
+            # PPO-Clip损失
+            surr1 = ratio * adta_detach
+            surr2 = torch.clip(ratio, 1 - self.epsilon, 1 + self.epsilon) * adta_detach
+            # 加入价值引导的策略损失
+            action_values = self.value(torch.index_select(states, 0, index=batch_indices)).squeeze()
+            value_weight = 0.1
+            action_loss = -torch.mean(torch.minimum(surr1, surr2)) + value_weight * torch.mean(-action_values)
 
-                # 累计统计信息
-                total_action_loss += action_loss.item()
-                total_value_loss += value_loss.item()
-                total_advantage += torch.mean(torch.abs(adta)).item()
-                total_ratio += torch.mean(ratio).item()
+            # 更新策略网络（保留梯度裁剪）
+            self.action_optim.zero_grad()
+            action_loss.backward(retain_graph=True)
+            torch.nn.utils.clip_grad_norm_(self.action.parameters(), max_norm=1.0)
+            self.action_optim.step()
 
-                # 记录每步更新的损失
-                self.logs['step_action_loss'].append(action_loss.item())
-                self.logs['step_value_loss'].append(value_loss.item())
+            # 更新价值网络
+            value_loss = self.loss(v_target, v)
+            self.value_optim.zero_grad()
+            value_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.value.parameters(), max_norm=1.0)
+            self.value_optim.step()
+
+            # 累计统计信息
+            total_action_loss += action_loss.item()
+            total_value_loss += value_loss.item()
+            total_advantage += torch.mean(torch.abs(adta)).item()
+            total_ratio += avg_ratio  # 用当前轮次的平均ratio
+
+            # 记录每步更新的损失
+            self.logs['step_action_loss'].append(action_loss.item())
+            self.logs['step_value_loss'].append(value_loss.item())
 
         # 计算平均统计信息并记录
         num_steps = self.up_time * max(10, int(10 * len(self.suffer) / self.batch_size))
@@ -302,7 +324,7 @@ class PPO():
         axes[0, 1].legend()
         axes[0, 1].grid(True)
 
-        # 3. 优势函数和策略更新比例
+        # 3. 优势函数
         axes[1, 0].plot(self.logs['update_advantage'], label='平均优势函数绝对值')
         axes[1, 0].set_title('优势函数变化')
         axes[1, 0].set_xlabel('更新轮次')
@@ -310,6 +332,7 @@ class PPO():
         axes[1, 0].legend()
         axes[1, 0].grid(True)
 
+        # 4. 策略更新比例
         axes[1, 1].plot(self.logs['update_ratio'], label='策略更新比例')
         axes[1, 1].axhline(y=1.0, color='r', linestyle='--', label='基准值1.0')
         axes[1, 1].axhline(y=1 + self.epsilon, color='g', linestyle='--', label=f'上限{1 + self.epsilon}')
